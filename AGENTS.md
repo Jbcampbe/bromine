@@ -15,6 +15,8 @@ framework).
 - Lint: `cargo clippy --workspace --all-targets -- -D warnings`
 - Generate large fixtures for grid and JSON work: `./scripts/make-large-fixture.sh 200000`
   (writes `large.csv` and a compact one-record-per-line `large.json`)
+- Regenerate the app icon: `./scripts/make-icon.sh` (needs `rsvg-convert`)
+- Build a local `.app` and dmg: `./scripts/bundle-macos.sh <target-triple> <version> <arch>`
 
 ### Build times are long, and the wait is silent
 
@@ -44,7 +46,10 @@ build, or a change to the dependency set or profile, pays the full cost.
 - `crates/bromine-core/` — format engines. Parsing, the table model, sorting,
   searching, and writing. **No GPUI dependency.**
 - `crates/bromine-ui/` — GPUI views. Depends on `bromine-core` and `gpui`.
-- `crates/bromine/` — the binary. Argument parsing, file loading, window setup.
+- `crates/bromine/` — the binary. Argument parsing, menu bar, file loading, window setup.
+- `assets/` — `icon.svg` (the icon source) and the committed `AppIcon.icns`.
+- `packaging/` — the `Info.plist` template the bundle script stamps.
+- `.github/workflows/` — the tag-driven release workflow.
 - `fixtures/` — sample data shared by core tests, UI development, and QA.
 - `scripts/` — developer helpers.
 
@@ -80,6 +85,38 @@ stitched shader source compiled on first launch instead. Consequences:
   builds, remove `runtime_shaders` from the workspace `Cargo.toml` and run
   `sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer`.
   Verify with `xcrun -f metal` before believing it worked.
+
+## Packaging and releases
+
+- `scripts/make-icon.sh` renders `assets/icon.svg` into `assets/icon-1024.png`,
+  `assets/AppIcon.iconset/`, and `assets/AppIcon.icns`. Only the SVG and the
+  `.icns` are in git. Rendering needs `rsvg-convert`; committing the `.icns`
+  means CI and a clean checkout do not.
+- `scripts/bundle-macos.sh <triple> <version> <arch>` wraps
+  `target/<triple>/release/bromine` in `dist/Bromine.app`, stamps
+  `packaging/Info.plist`, signs ad-hoc by default, and writes
+  `dist/Bromine-<version>-<arch>.dmg` containing the app and an `/Applications`
+  symlink. It never invokes cargo, and it refuses when the binary or the icon is
+  missing.
+- `SIGN_IDENTITY` overrides the ad-hoc signature. Any identity other than `-`
+  also turns on the hardened runtime and a secure timestamp, which notarization
+  requires.
+- `.github/workflows/release.yml` runs on a `v*` tag. `macos-15-intel` builds
+  x86_64 and `macos-15` builds aarch64, both natively. `fail-fast: false` keeps
+  one architecture's result visible when the other fails. The `publish` job runs
+  on `ubuntu-latest`, collects both dmgs, writes one `SHA256SUMS.txt`, and uses
+  the preinstalled `gh` CLI to create or update the release.
+- Secrets, all optional:
+  - `MACOS_CERT_P12` — base64 of a `.p12` holding a Developer ID Application
+    certificate. Without it the build is ad-hoc signed.
+  - `MACOS_CERT_PASSWORD` — the password for that `.p12`.
+  - `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_PASSWORD` — the notarytool
+    credentials. All three, plus the certificate, run
+    `notarytool submit --wait` and then `stapler staple`.
+  With none set the workflow produces ad-hoc builds and does not fail.
+- The version is the tag without its leading `v`. `bundle-macos.sh` rejects a
+  version that is not numeric and dotted, so a tag such as `v0.1.0-rc1` has to be
+  renamed or the script taught about pre-release versions first.
 
 ## GPUI 0.2.2 notes
 
@@ -181,6 +218,9 @@ them after an upgrade.
 - **`prompt_for_paths` is `unimplemented!()` in the test platform.** Any test that
   reaches the open dialog panics, so keep the dialog in its own handler and test
   the code that handler calls.
+- **`App::set_menus` is a no-op in the test platform.** A menu item and the key
+  equivalent printed beside it can only be checked by launching the bundled app;
+  the action behind the item is tested through `Workspace::request_quit`.
 - **`PathPromptOptions` has no `Default` and no builder methods**, and cannot
   filter by file type. The panel lets the user pick anything, so the loader has
   to reject what it cannot show.
@@ -188,6 +228,12 @@ them after an upgrade.
   an async step such as the open dialog resolving.
 - **`SharedString::as_deref()` yields `&ArcCow<str>`, not `&str`.** Convert with
   `.map(|value| &**value)`.
+- **GPUI installs no menu bar unless the app calls `App::set_menus`.** Without
+  one there is no Quit item and Cmd+Q does nothing. The key equivalents shown
+  in the menu come from the keymap, so `cx.bind_keys` has to run before
+  `cx.set_menus`. There is deliberately no Edit > Copy: a `cmd-c` binding
+  suppresses the grid's `on_key_down` copy, so that menu item waits for the
+  text-editing foundation.
 
 ## Testing views
 
@@ -283,6 +329,10 @@ Before calling work finished:
 2. `cargo clippy --workspace --all-targets -- -D warnings`
 3. `cargo test --workspace`
 4. For any UI change, actually launch it: `cargo run -p bromine -- fixtures/people.csv`
+5. For a packaging change, build a bundle and check it:
+   `./scripts/bundle-macos.sh <triple> <version> <arch>`, then `codesign -dv`
+   on `dist/Bromine.app` (ad-hoc reports `flags=0x2(adhoc)`) and launch the app
+   from the mounted dmg.
 
 A passing test suite does not show that a window renders. If you cannot launch
 and look at the app, say so plainly instead of implying you did.

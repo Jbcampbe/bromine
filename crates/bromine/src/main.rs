@@ -7,16 +7,36 @@
 //! Every path on the command line becomes a tab. With no arguments the window
 //! opens empty, and files are opened from inside it with Cmd+O.
 
+mod cli;
+
 use std::path::PathBuf;
 
-use bromine_ui::{CloseTab, OpenFile, Workspace};
+use bromine_ui::{CloseTab, OpenFile, Quit, Workspace};
 use gpui::{
-    Application, Bounds, KeyBinding, SharedString, TitlebarOptions, WindowBounds, WindowOptions,
-    prelude::*, px, size,
+    Application, Bounds, KeyBinding, Menu, MenuItem, SharedString, SystemMenuType, TitlebarOptions,
+    WindowBounds, WindowOptions, prelude::*, px, size,
 };
 
 fn main() {
-    let paths: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+    let invocation = match cli::parse(std::env::args_os().skip(1)) {
+        Ok(invocation) => invocation,
+        Err(message) => {
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+    };
+
+    let paths: Vec<PathBuf> = match invocation {
+        cli::Invocation::Run(paths) => paths,
+        cli::Invocation::Version => {
+            println!("Bromine {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
+        cli::Invocation::Help => {
+            println!("{}", cli::USAGE);
+            return;
+        }
+    };
 
     Application::new().run(move |cx| {
         let options = WindowOptions {
@@ -38,6 +58,29 @@ fn main() {
         cx.bind_keys([
             KeyBinding::new("cmd-o", OpenFile, None),
             KeyBinding::new("cmd-w", CloseTab, None),
+            KeyBinding::new("cmd-q", Quit, None),
+        ]);
+
+        // GPUI installs no menu bar unless asked, and without one there is no
+        // Quit item and Cmd+Q does nothing. The key equivalents themselves come
+        // from the bindings above. Deliberately no Edit > Copy: binding `cmd-c`
+        // would suppress the grid's own copy listener.
+        cx.set_menus(vec![
+            Menu {
+                name: "Bromine".into(),
+                items: vec![
+                    MenuItem::os_submenu("Services", SystemMenuType::Services),
+                    MenuItem::separator(),
+                    MenuItem::action("Quit Bromine", Quit),
+                ],
+            },
+            Menu {
+                name: "File".into(),
+                items: vec![
+                    MenuItem::action("Open\u{2026}", OpenFile),
+                    MenuItem::action("Close Tab", CloseTab),
+                ],
+            },
         ]);
 
         let workspace = cx.new(Workspace::new);

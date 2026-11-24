@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!--
+    The source of the app icon. Letterforms are paths, never <text>, so
+    rasterizing does not depend on the fonts installed on the machine.
+
+    Colours are copied from crates/bromine-ui/src/theme.rs:
+      background #17191C, border #343A3D, accent #67BFE4.
+    macOS lays a 1024 icon out as an 824x824 tile centred with 100 px of
+    transparent margin, so this one does too.
+  -->
+  <defs>
+    <clipPath id="tile">
+      <rect x="100" y="100" width="824" height="824" rx="185" />
+    </clipPath>
+  </defs>
+
+  <rect x="100" y="100" width="824" height="824" rx="185"
+        fill="#17191C" stroke="#343A3D" stroke-width="6" />
+
+  <!-- Faint grid lines: the data behind the name. -->
+  <g clip-path="url(#tile)" stroke="#343A3D" stroke-width="2" opacity="0.6">
+    <path d="M203 100 V924 M306 100 V924 M409 100 V924 M512 100 V924
+             M615 100 V924 M718 100 V924 M821 100 V924" />
+    <path d="M100 203 H924 M100 306 H924 M100 409 H924 M100 512 H924
+             M100 615 H924 M100 718 H924 M100 821 H924" />
+  </g>
+
+  <!--
+    Br, weighted like a display face: the B's bowls are 105-radius arcs, the
+    r is a stem and a 70-radius shoulder. Stroke widths of 78 keep the mark
+    readable at 16 px.
+  -->
+  <g transform="translate(-35 20)" fill="none" stroke="#67BFE4" stroke-width="78"
+     stroke-linecap="round" stroke-linejoin="round">
+    <path d="M290 700 V280 H450 A105 105 0 0 1 450 490 H290 H470 A105 105 0 0 1 470 700 H290" />
+    <path d="M660 700 V430 H740 A70 70 0 0 1 810 500" />
+  </g>
+</svg>

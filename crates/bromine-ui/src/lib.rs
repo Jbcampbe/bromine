@@ -11,4 +11,4 @@ mod workspace;
 
 pub use csv_grid::{CsvGrid, ROW_HEIGHT};
 pub use json_view::{JsonMode, JsonView};
-pub use workspace::{CloseTab, OpenFile, Workspace};
+pub use workspace::{CloseTab, OpenFile, Quit, Workspace};

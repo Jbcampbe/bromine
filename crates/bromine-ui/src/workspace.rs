@@ -16,7 +16,7 @@ use crate::csv_grid::CsvGrid;
 use crate::json_view::JsonView;
 use crate::theme;
 
-actions!(bromine, [OpenFile, CloseTab]);
+actions!(bromine, [OpenFile, CloseTab, Quit]);
 
 /// One open document, whichever viewer it needs.
 ///
@@ -77,6 +77,10 @@ pub struct Workspace {
     /// discards them, because there is no undo behind this: one keystroke should
     /// not be able to throw away work it never mentioned.
     pending_close: Option<usize>,
+    /// Whether the user has already been warned that quitting would lose
+    /// edits. A second Quit goes through; any change in a tab clears this, so
+    /// an edit made after the warning makes the next Quit ask again.
+    pending_quit: bool,
     /// Focused only when no tab is open, so shortcuts still have a target.
     focus_handle: FocusHandle,
 }
@@ -90,6 +94,7 @@ impl Workspace {
             error: None,
             prompting: false,
             pending_close: None,
+            pending_quit: false,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -99,9 +104,11 @@ impl Workspace {
     /// render, and a child's `cx.notify()` does not redraw its parent.
     fn track<T: 'static>(&mut self, entity: &Entity<T>, cx: &mut Context<Self>) {
         cx.observe(entity, |workspace: &mut Self, _, cx| {
-            // The view changed under the user, so any half-given close
-            // instruction is stale.
+            // The view changed under the user, so any half-given close or quit
+            // instruction is stale. In particular, saving a tab must disarm the
+            // quit warning that a save was offered for.
             workspace.pending_close = None;
+            workspace.pending_quit = false;
             cx.notify();
         })
         .detach();
@@ -243,6 +250,29 @@ impl Workspace {
         }
     }
 
+    /// Quit, refusing once when a tab has edits that are not on disk.
+    ///
+    /// The rule is the one closing a dirty tab already uses: the first request
+    /// explains itself in the error strip, and a second one goes through. There
+    /// is no undo for a discarded edit, so one keystroke must not be able to
+    /// end the process and take the work with it.
+    ///
+    /// Returns whether quitting was allowed, which is how the tests can tell
+    /// the two requests apart on a platform where `App::quit` does nothing.
+    pub fn request_quit(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.tabs.iter().any(|tab| tab.is_dirty(cx)) && !self.pending_quit {
+            self.pending_quit = true;
+            self.error = Some(SharedString::from(
+                "unsaved changes: Cmd+S keeps them, Cmd+Q again quits without saving",
+            ));
+            cx.notify();
+            return false;
+        }
+
+        cx.quit();
+        true
+    }
+
     /// Ask the user for files and open the ones they pick.
     ///
     /// The panel gives no way to filter by extension, so a user can pick any
@@ -293,6 +323,10 @@ impl Workspace {
 
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
         self.close_active(window, cx);
+    }
+
+    fn quit(&mut self, _: &Quit, _window: &mut Window, cx: &mut Context<Self>) {
+        self.request_quit(cx);
     }
 
     /// The index of an already-open document with the same file behind `path`.
@@ -464,6 +498,12 @@ impl Workspace {
             .child(div().text_color(theme::text_muted()).child("No file open"))
             .child(
                 div()
+                    .text_xs()
+                    .text_color(theme::text_muted())
+                    .child(format!("Bromine {}", env!("CARGO_PKG_VERSION"))),
+            )
+            .child(
+                div()
                     .id("empty-open")
                     .px_3()
                     .py_2()
@@ -509,6 +549,7 @@ impl Render for Workspace {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::open_file))
             .on_action(cx.listener(Self::close_tab))
+            .on_action(cx.listener(Self::quit))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _event: &MouseDownEvent, window, _cx| {
@@ -734,6 +775,71 @@ mod tests {
             cx.update(|_window, app| workspace.read(app).error().is_none()),
             "the notice belonged to the tab that has now gone"
         );
+    }
+
+    #[gpui::test]
+    fn quitting_with_clean_tabs_does_not_ask(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(|_window, cx| Workspace::new(cx));
+
+        let allowed = cx.update(|_window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.open(fixture("people.csv"), cx);
+                workspace.request_quit(cx)
+            })
+        });
+
+        assert!(allowed, "a workspace with no unsaved edits quits at once");
+    }
+
+    #[gpui::test]
+    fn quitting_with_unsaved_edits_asks_before_it_discards_them(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(|_window, cx| Workspace::new(cx));
+
+        cx.update(|_window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.open(fixture("people.csv"), cx)
+            });
+        });
+
+        // Make the visible tab dirty the way a user does.
+        let button = cx
+            .debug_bounds("edit-insert-row")
+            .expect("the grid's add-row button was laid out");
+        cx.simulate_mouse_down(button.center(), MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(button.center(), MouseButton::Left, Modifiers::none());
+
+        let first = cx.update(|_window, app| {
+            workspace.update(app, |workspace, cx| workspace.request_quit(cx))
+        });
+        assert!(!first, "one Quit must not discard edits");
+        let error = cx
+            .update(|_window, app| workspace.read(app).error().map(str::to_string))
+            .expect("the refusal has to say what happened");
+        assert!(
+            error.contains("unsaved changes"),
+            "unexpected message: {error}"
+        );
+
+        // A change in a tab withdraws the warning, so an edit made after it
+        // makes the next Quit ask again rather than quitting silently.
+        let button = cx
+            .debug_bounds("edit-insert-row")
+            .expect("the button is still laid out");
+        cx.simulate_mouse_down(button.center(), MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(button.center(), MouseButton::Left, Modifiers::none());
+
+        let after_edit = cx.update(|_window, app| {
+            workspace.update(app, |workspace, cx| workspace.request_quit(cx))
+        });
+        assert!(
+            !after_edit,
+            "an edit after the warning must re-arm the warning"
+        );
+
+        let second = cx.update(|_window, app| {
+            workspace.update(app, |workspace, cx| workspace.request_quit(cx))
+        });
+        assert!(second, "asking twice quits without saving");
     }
 
     #[gpui::test]

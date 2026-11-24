@@ -42,6 +42,27 @@ everywhere. Views must not inline raw colors.
 Add a token rather than a one-off colour. If a colour appears twice in views and
 is not a token, it should be one.
 
+## The icon
+
+The Dock icon is the app's only illustration, so it follows the same rules as
+the window.
+
+- **Vector source, one drawing at every size.** `assets/icon.svg` is the source,
+  and `scripts/make-icon.sh` rasterizes every iconset entry from it. Do not
+  replace it with a hand-pixeled 16 px variant: the small icon is the same
+  drawing, not a different one.
+- **Letterforms are paths, never `<text>`.** A `<text>` element makes the icon
+  depend on fonts installed wherever it is rendered; rasterizing on a machine
+  without that face would produce a different mark.
+- **Palette only.** The tile is `background`, its edge is `border`, and the mark
+  is `accent`. The grid lines behind the letters are the theme's slate, not a
+  new colour.
+- **Legible at 16 px.** The mark is chunky enough to read as "Br" in a Finder
+  list. A change that only works at 512 px is not finished.
+- **macOS geometry.** A 1024 canvas with an 824 px rounded tile centred in it is
+  Apple's icon grid. The transparent margin is what keeps the icon the same
+  weight in the Dock as the apps beside it.
+
 ## Type scale
 
 Three sizes is enough: a small size for metadata, a base size for cells and
@@ -54,6 +75,15 @@ labels, and one larger size for a file name or heading. Resist adding a fourth.
   tab is distinguished by background, not by an underline or a heavier border.
   Tabs shrink and truncate rather than scrolling; a tab bar that scrolls is a
   later problem.
+- A native menu bar: **Bromine** (Services, Quit) and **File** (Open…, Close
+  Tab). The key equivalent shown beside an item comes from the app's keymap, so
+  the menu names the key the app actually listens for. There is deliberately no
+  Edit menu yet: binding `cmd-c` would suppress the grid's own copy handler, and
+  Copy belongs there only once that conflict is gone.
+- Quit is guarded the way Close Tab is. With unsaved edits the first Cmd+Q
+  explains itself in the error strip and the second quits; one keystroke must
+  not be able to throw work away. `Workspace::request_quit` owns that rule so
+  the menu item, the key equivalent, and any future dock menu share it.
 - A search bar, kept minimal: one field and a match count.
 - The grid, which takes all remaining space and scrolls in both directions. Its
   header row scrolls sideways with the rows and stays put vertically.

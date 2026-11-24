@@ -1,0 +1,133 @@
+name: release
+
+# A pushed `v*` tag is the release trigger. The work is two native builds, one
+# per architecture, then one publish job so a single arch cannot ship alone.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # One architecture failing must not cancel the other: the report of what
+      # broke is more useful when both legs have finished.
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            arch: x86_64
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            arch: aarch64
+    env:
+      # All four are optional. None of them means an ad-hoc signed build, which
+      # is what this project ships by default. A Developer ID certificate
+      # upgrades the signature to a notarizable one; the Apple ID trio adds the
+      # notarization ticket. See AGENTS.md.
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }} -p bromine
+
+      - name: Import signing certificate
+        if: ${{ env.MACOS_CERT_P12 != '' }}
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/bromine-signing.keychain-db"
+          password="$(openssl rand -base64 24)"
+          printf '%s' "$MACOS_CERT_P12" | openssl base64 -d > "$RUNNER_TEMP/cert.p12"
+
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
+            -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" \
+            $(security list-keychains -d user | tr -d '"')
+
+          identity="$(security find-identity -v -p codesigning "$keychain" \
+            | awk '/Developer ID Application/ { print $2; exit }')"
+          if [[ -z "$identity" ]]; then
+            echo "no Developer ID Application identity in the imported certificate" >&2
+            exit 1
+          fi
+          echo "SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Bundle and package
+        run: ./scripts/bundle-macos.sh "${{ matrix.target }}" "${GITHUB_REF_NAME#v}" "${{ matrix.arch }}"
+
+      - name: Notarize the dmg
+        if: ${{ env.MACOS_CERT_P12 != '' && env.APPLE_ID != '' && env.APPLE_TEAM_ID != '' && env.APPLE_APP_PASSWORD != '' }}
+        run: |
+          set -euo pipefail
+          dmg="dist/Bromine-${GITHUB_REF_NAME#v}-${{ matrix.arch }}.dmg"
+          xcrun notarytool submit "$dmg" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --wait
+          xcrun stapler staple "$dmg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bromine-${{ matrix.arch }}
+          path: dist/Bromine-*-${{ matrix.arch }}.dmg
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bromine-*
+          path: dist
+          merge-multiple: true
+
+      - name: Write checksums
+        working-directory: dist
+        run: sha256sum *.dmg > SHA256SUMS.txt
+
+      - name: Create or update the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/*.dmg dist/SHA256SUMS.txt --clobber
+          else
+            gh release create "$tag" \
+              --title "Bromine ${tag#v}" \
+              --generate-notes \
+              dist/*.dmg dist/SHA256SUMS.txt
+          fi
