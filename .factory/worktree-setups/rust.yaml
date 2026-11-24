@@ -1,0 +1,12 @@
+name: Rust
+script: |
+  set -euo pipefail
+  # Warm the dependency graph so the first in-worktree build is not a cold one.
+  # A worktree gets its own target directory, so this still compiles GPUI once
+  # per worktree rather than sharing it with the main checkout. See AGENTS.md.
+  cargo fetch
+initial_prompt: |
+  Read AGENTS.md before starting. This is a Rust workspace with a GPUI
+  dependency pinned to =0.2.2, built with the `runtime_shaders` feature because
+  this machine has no full Xcode. Run `cargo test --workspace` first to confirm
+  the baseline is green before changing anything.

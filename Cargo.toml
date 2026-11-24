@@ -1,0 +1,32 @@
+[workspace]
+resolver = "3"
+members = ["crates/bromine", "crates/bromine-core", "crates/bromine-ui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.90"
+
+[workspace.dependencies]
+bromine-core = { path = "crates/bromine-core" }
+bromine-ui = { path = "crates/bromine-ui" }
+
+anyhow = "1"
+csv = "1.4"
+thiserror = "2"
+
+# GPUI is pre-1.0 and the API moves between releases, so the version is pinned
+# exactly. `runtime_shaders` compiles GPUI's Metal shaders at startup instead of
+# build time, which removes the build dependency on Xcode's `metal`/`metallib`
+# (Xcode Command Line Tools alone are enough). See AGENTS.md.
+gpui = { version = "=0.2.2", features = ["runtime_shaders"] }
+
+# GPUI spends most of its time in its own dependency tree, and an unoptimized
+# render loop is unusable in a GUI app. Build dependencies optimized, keep our
+# own crates debuggable.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

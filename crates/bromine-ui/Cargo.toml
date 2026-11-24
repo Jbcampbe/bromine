@@ -1,0 +1,16 @@
+[package]
+name = "bromine-ui"
+description = "GPUI views for Bromine."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bromine-core.workspace = true
+gpui.workspace = true
+
+[dev-dependencies]
+# The view tests drive real frames, which needs gpui's test instrumentation
+# (`debug_selector` is compiled out without it).
+gpui = { workspace = true, features = ["test-support"] }

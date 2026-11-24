@@ -1,0 +1,11 @@
+[package]
+name = "bromine-core"
+description = "Format engines for Bromine: parse, model, query, and write developer data formats."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+csv.workspace = true
+thiserror.workspace = true

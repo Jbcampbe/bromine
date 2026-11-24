@@ -1,0 +1,17 @@
+[package]
+name = "bromine"
+description = "Bromine: a viewer and editor for the developer data formats you meet in the wild."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "bromine"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+bromine-core.workspace = true
+bromine-ui.workspace = true
+gpui.workspace = true
