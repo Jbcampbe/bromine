@@ -97,7 +97,15 @@ them after an upgrade.
   need a `SharedString` at all.
 - **Flex items do not shrink on their own.** With `min-width: auto` a cell will
   overflow instead of truncating. Put `.min_w(px(0.0))` next to `.flex_1()` and
-  the `.truncate()` will actually apply.
+  the `.truncate()` will actually apply. The reverse bites too: a child with an
+  explicit `.w(px(..))` still has `flex-shrink: 1`, so it gets squeezed below its
+  measured width unless it also carries `.flex_shrink_0()`.
+- **`shape_line` lives on `WindowTextSystem`, not `TextSystem`.** Text shaping
+  needs a window, so it is unavailable from `Context::text_system()`, which
+  returns a plain `Arc<TextSystem>`. That type does expose `resolve_font`,
+  `advance`, and `ch_width`, which is enough to measure text without a window:
+  resolve the font once, then sum per-character advances. The grid sizes its
+  columns that way at load.
 - **`uniform_list` measures the first row.** Every row must be exactly the same
   height (`ROW_HEIGHT`), and the list handles its own wheel scrolling, so
   `.track_scroll()` is only needed for programmatic scrolling.

@@ -51,14 +51,20 @@ labels, and one larger size for a file name or heading. Resist adding a fourth.
   tab is distinguished by background, not by an underline or a heavier border.
   Tabs shrink and truncate rather than scrolling; a tab bar that scrolls is a
   later problem.
-- A header strip carrying the row and column counts and any repair warning. The
-  file name lives in the tab, so it is not repeated here.
 - A search bar, kept minimal: one field and a match count.
-- The grid, which takes all remaining space and is the only scrolling region.
+- The grid, which takes all remaining space and scrolls in both directions. Its
+  header row scrolls sideways with the rows and stays put vertically.
+- A status strip along the bottom carrying the row and column counts, the read
+  only notice, and any repair warning. The file name lives in the tab, so it is
+  not repeated here, and the status strip sits below the grid so the eye finds
+  nothing between the tabs and the data.
 - An error strip, under the tab strip, only when opening a file failed. It is
   dismissable and never covers the grid.
-- Column widths are uniform and fixed for now. Per-column sizing is a later
-  problem; solving it early would fight `uniform_list`.
+- Column widths are measured from the content a column holds: the widest value
+  in it, or its header if that is wider. Widths are computed once when a file
+  opens, never per frame, and clamped to 56–420 px so a single pathological
+  value cannot crowd out every other column. A table wider than the window
+  scrolls sideways rather than squeezing columns below their measured width.
 
 ## The Markdown goal
 
