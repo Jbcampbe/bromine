@@ -105,7 +105,9 @@ stitched shader source compiled on first launch instead. Consequences:
   x86_64 and `macos-15` builds aarch64, both natively. `fail-fast: false` keeps
   one architecture's result visible when the other fails. The `publish` job runs
   on `ubuntu-latest`, collects both dmgs, writes one `SHA256SUMS.txt`, and uses
-  the preinstalled `gh` CLI to create or update the release.
+  the preinstalled `gh` CLI to create or update the release. It has no checkout,
+  so every `gh` command passes `--repo "$GITHUB_REPOSITORY"`; without that gh
+  fails with `failed to run git: not a git repository`.
 - Secrets, all optional:
   - `MACOS_CERT_P12` — base64 of a `.p12` holding a Developer ID Application
     certificate. Without it the build is ad-hoc signed.
