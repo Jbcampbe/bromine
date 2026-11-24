@@ -56,6 +56,12 @@ pub fn warning() -> Hsla {
     hsla(0.09, 0.80, 0.62, 1.0)
 }
 
+/// The scrollbar thumbs. Quiet enough to ignore until it is looked for, but
+/// present enough to find.
+pub fn scrollbar() -> Hsla {
+    hsla(0.611, 0.08, 0.34, 1.0)
+}
+
 /// The font for cell values and column headers.
 ///
 /// Values are monospaced so digit columns line up and can be compared by eye.

@@ -54,6 +54,13 @@ labels, and one larger size for a file name or heading. Resist adding a fourth.
 - A search bar, kept minimal: one field and a match count.
 - The grid, which takes all remaining space and scrolls in both directions. Its
   header row scrolls sideways with the rows and stays put vertically.
+- One axis per gesture. A trackpad reports both axes in the same event, and a
+  grid that moved on both feels drunk; a gesture keeps the axis it started on
+  until the fingers lift. A mouse wheel picks per event, because it has no
+  gesture to keep.
+- Thin scrollbars along the right and bottom edges, drawn only when that axis
+  actually overflows. They are indicators of position and proportion, not
+  controls: a bar you can drag is a later increment.
 - A status strip along the bottom carrying the row and column counts, the read
   only notice, and any repair warning. The file name lives in the tab, so it is
   not repeated here, and the status strip sits below the grid so the eye finds

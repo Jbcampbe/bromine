@@ -23,6 +23,10 @@ recognised but not implemented.
 - Sizes each column to its content: the widest value it holds, or its header if
   that is wider, clamped to 56–420 px. A table wider than the window scrolls
   sideways instead of squeezing columns.
+- Scrolls in one direction at a time: a swipe or wheel gesture picks the axis it
+  starts on, so a diagonal trackpad movement does not drag the grid diagonally.
+  Thin scrollbars along the right and bottom edges show where in the file you
+  are.
 - Reports row and column counts along the bottom of the window, and says so when
   the parser had to repair ragged input or decode a file that was not valid
   UTF-8.
@@ -33,6 +37,8 @@ recognised but not implemented.
 - JSON and Markdown. Opening one of those files reports why in the window.
 - Resizing a column by dragging its edge. Widths are measured from content, and
   a value longer than the widest column is truncated with an ellipsis.
+- Dragging a scrollbar. The bars show the position and the proportions of the
+  view; the wheel, trackpad, and keyboard are the only ways to move.
 - A real search field with a caret. Search is driven by raw keystrokes, which
   means it has no cursor, no selection, and no undo.
 - Reordering tabs, and closing the window when the last tab closes.
@@ -60,16 +66,17 @@ paying that cost.
 ## Tests
 
 ```bash
-cargo test --workspace        # 66 tests: 38 core, 8 fixture contracts, 20 views
+cargo test --workspace        # 74 tests: 38 core, 8 fixture contracts, 28 views
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 `bromine-core` has no GPUI dependency, so parsing, sorting, searching, and
-writing are tested headlessly. The twenty view tests drive real frames with
-GPUI's test harness: they type into the window, click column headers, click
-tabs, send Cmd+W through the real keymap, and assert on laid-out bounds to check
-that columns get the width they were measured at and that the status strip sits
-below the grid.
+writing are tested headlessly. The twenty-eight view tests drive real frames with
+GPUI's test harness: they type into the window, click column headers, click tabs,
+send Cmd+W through the real keymap, dispatch wheel events, and assert on laid-out
+bounds to check that columns get the width they were measured at, that a diagonal
+gesture moves one axis only, that only the rows in view are drawn, and where the
+scrollbars and status strip sit.
 
 ## Layout
 

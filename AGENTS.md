@@ -108,7 +108,28 @@ them after an upgrade.
   columns that way at load.
 - **`uniform_list` measures the first row.** Every row must be exactly the same
   height (`ROW_HEIGHT`), and the list handles its own wheel scrolling, so
-  `.track_scroll()` is only needed for programmatic scrolling.
+  `.track_scroll()` is only needed for programmatic scrolling. It also owns that
+  scrolling outright: it cannot be told to leave an axis alone, which is why the
+  grid renders its own visible row slice instead.
+- **There is no scrollbar widget.** `Style::scrollbar_width` only reserves layout
+  space; nothing is painted. A visible scrollbar has to be drawn, from a
+  `ScrollHandle`'s `offset()`, `bounds()`, and `max_offset()`.
+- **`.overflow_hidden().track_scroll(&handle)` is the manual scroll container.**
+  A tracked handle makes the element clip and translate its children and fills in
+  `bounds()` and `max_offset()`, but the element's own wheel listener zeroes every
+  delta because its overflow is not `Scroll`. That is the combination to use when
+  the view has to own the scroll position itself.
+- **`on_scroll_wheel` is bubble-only, and bubble runs deepest first.** There is no
+  capture-phase scroll hook, so an ancestor cannot preempt a scroller inside it.
+  With two nested scrollers, each takes the axis it owns from the same diagonal
+  event. `allow_concurrent_scroll` and `restrict_scroll_to_axis` only arbitrate
+  within one scroller, so they cannot stop two of them from both moving.
+  `Hitbox::should_handle_scroll` does accept an ancestor, which is what lets one
+  handler cover the whole grid.
+- **A `flex_1` child of a container with no height during layout takes its
+  content's height.** Marking it `.min_h(px(0.0))` does not help. When the
+  geometry has to be exact regardless, position the child with
+  `.absolute().top(..).bottom(..).left(..).right(..)` instead.
 - **There is no text field widget.** A real editable field needs
   `EntityInputHandler` plus `window.handle_input(...)` during paint. Until that
   exists, the search box is driven by raw `KeyDownEvent.keystroke.key_char`.
@@ -148,6 +169,13 @@ Two more details worth knowing:
 - `VisualTestContext::debug_bounds` requires a `&'static str`, so selectors are
   formatted at construction (`format!("header-{column}")`) and looked up with a
   literal (`"header-1"`).
+- **`debug_bounds` accumulates across frames.** `Frame::clear` does not reset the
+  map, so a key once seen stays even after the element stops being drawn. Never
+  assert that a selector is absent after the first frame; assert that something
+  new appeared instead.
+- **`VisualTestContext::simulate_event` dispatches any `InputEvent`, including
+  `ScrollWheelEvent`.** Hover the element with `simulate_mouse_move` first,
+  because hit testing uses the window's mouse position rather than the event's.
 
 There is no rendered-text reader. Assert on view state (`cell_at`,
 `visible_row_count`) or on `debug_bounds`, never on what "looks right".
