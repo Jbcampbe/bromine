@@ -15,3 +15,4 @@ anyhow.workspace = true
 bromine-core.workspace = true
 bromine-ui.workspace = true
 gpui.workspace = true
+url.workspace = true

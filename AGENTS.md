@@ -230,6 +230,11 @@ them after an upgrade.
   an async step such as the open dialog resolving.
 - **`SharedString::as_deref()` yields `&ArcCow<str>`, not `&str`.** Convert with
   `.map(|value| &**value)`.
+- **`on_open_urls` is on `Application`, not `App`.** A double-clicked file
+  arrives as an `application:openURLs:` event, never as a command-line
+  argument, so Finder launches would otherwise open an empty window. Register
+  the handler before `run`; it receives no context, so hold an `AsyncApp` from
+  the launch callback and use that to open the paths once a window exists.
 - **GPUI installs no menu bar unless the app calls `App::set_menus`.** Without
   one there is no Quit item and Cmd+Q does nothing. The key equivalents shown
   in the menu come from the keymap, so `cx.bind_keys` has to run before

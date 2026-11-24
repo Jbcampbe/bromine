@@ -685,6 +685,7 @@ dependencies = [
  "bromine-core",
  "bromine-ui",
  "gpui",
+ "url",
 ]
 
 [[package]]

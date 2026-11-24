@@ -21,6 +21,11 @@ thiserror = "2"
 # not the one on disk, and formatting would destroy the original order.
 serde_json = { version = "1", features = ["preserve_order"] }
 
+# The binary decodes the `file://` URLs macOS sends when a document is opened.
+# The crate is already in the dependency graph through GPUI, so this adds no
+# new code to the build.
+url = "2"
+
 # GPUI is pre-1.0 and the API moves between releases, so the version is pinned
 # exactly. `runtime_shaders` compiles GPUI's Metal shaders at startup instead of
 # build time, which removes the build dependency on Xcode's `metal`/`metallib`
