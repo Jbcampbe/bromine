@@ -141,6 +141,18 @@ impl Table {
         self.rows.len() - 1
     }
 
+    /// Insert an empty row at `index`, clamped to the end of the table.
+    ///
+    /// Returns the index the row actually landed at, because a caller that
+    /// asked for a position past the end still needs to know where to select
+    /// or edit the row it just created.
+    pub fn insert_row(&mut self, index: usize) -> usize {
+        let index = index.min(self.rows.len());
+        let width = self.column_count();
+        self.rows.insert(index, vec![String::new(); width]);
+        index
+    }
+
     pub fn remove_row(&mut self, row: usize) -> Result<Vec<String>, CoreError> {
         if row >= self.rows.len() {
             return Err(CoreError::NoSuchRow {
@@ -149,6 +161,42 @@ impl Table {
             });
         }
         Ok(self.rows.remove(row))
+    }
+
+    /// Insert a named column at `index`, clamped to the existing width.
+    ///
+    /// Every row gains a cell at the same position, including rows that are
+    /// still shorter than the requested index: a ragged row is clamped to its
+    /// own end instead of being padded, so one bad record cannot abort the
+    /// edit for the whole table.
+    pub fn insert_column(&mut self, index: usize, name: String) -> usize {
+        let index = index.min(self.headers.len());
+        self.headers.insert(index, name);
+        for row in &mut self.rows {
+            let at = index.min(row.len());
+            row.insert(at, String::new());
+        }
+        index
+    }
+
+    /// Remove a column and return its header name.
+    ///
+    /// Rows shorter than the column have nothing at that index, so they are
+    /// left alone rather than being padded just to be cut again.
+    pub fn remove_column(&mut self, index: usize) -> Result<String, CoreError> {
+        let columns = self.column_count();
+        if index >= columns {
+            return Err(CoreError::NoSuchColumn {
+                column: index,
+                columns,
+            });
+        }
+        for row in &mut self.rows {
+            if index < row.len() {
+                row.remove(index);
+            }
+        }
+        Ok(self.headers.remove(index))
     }
 
     /// True when every cell in the row is empty after trimming.
@@ -265,5 +313,167 @@ mod tests {
         assert!(table.row_is_blank(0));
         assert!(!table.row_is_blank(1));
         assert!(!table.row_is_blank(7));
+    }
+
+    #[test]
+    fn insert_row_works_at_start_middle_end_and_past_the_end() {
+        let mut table = Table::new(
+            headers(),
+            vec![
+                vec!["ada".into(), "engineer".into()],
+                vec!["grace".into(), "admiral".into()],
+            ],
+        );
+
+        assert_eq!(table.insert_row(0), 0);
+        assert_eq!(table.get(0, 0), Some(""));
+        assert_eq!(table.get(1, 0), Some("ada"));
+
+        assert_eq!(table.insert_row(2), 2);
+        assert_eq!(table.get(2, 0), Some(""));
+        assert_eq!(table.get(3, 0), Some("grace"));
+
+        assert_eq!(table.insert_row(4), 4);
+        assert_eq!(table.row_count(), 5);
+
+        // Past the end lands at the end and reports where it landed.
+        assert_eq!(table.insert_row(99), 5);
+        assert_eq!(table.row_count(), 6);
+        assert_eq!(
+            table.row(5).unwrap().to_vec(),
+            vec![String::new(), String::new()]
+        );
+    }
+
+    #[test]
+    fn insert_column_into_a_ragged_table_pads_every_row() {
+        // The public constructors always make a rectangle, but a later edit or
+        // a short row can leave rows of different widths, so insertion has to
+        // cope with that directly.
+        let mut table = Table {
+            headers: headers(),
+            rows: vec![
+                vec!["ada".into()],
+                vec!["grace".into(), "admiral".into(), "extra".into()],
+            ],
+        };
+
+        assert_eq!(table.insert_column(1, "rank".into()), 1);
+        assert_eq!(table.header(1), Some("rank"));
+        assert_eq!(table.column_count(), 3);
+
+        assert_eq!(
+            table.row(0).unwrap().to_vec(),
+            vec!["ada".to_string(), String::new()]
+        );
+        assert_eq!(
+            table.row(1).unwrap().to_vec(),
+            vec![
+                "grace".to_string(),
+                String::new(),
+                "admiral".to_string(),
+                "extra".to_string()
+            ]
+        );
+        assert_eq!(table.get(1, 2), Some("admiral"));
+    }
+
+    #[test]
+    fn remove_column_keeps_later_cells_aligned() {
+        let mut table = Table::new(
+            vec!["name".into(), "role".into(), "city".into()],
+            vec![
+                vec!["ada".into(), "engineer".into(), "london".into()],
+                vec!["grace".into(), "admiral".into(), "arlington".into()],
+            ],
+        );
+
+        let removed = table.remove_column(1).unwrap();
+        assert_eq!(removed, "role");
+        assert_eq!(table.column_count(), 2);
+        assert_eq!(table.header(1), Some("city"));
+        // The neighbour after the hole must still hold the value that was
+        // there before, not the cell that shifted into its place.
+        assert_eq!(table.get(0, 0), Some("ada"));
+        assert_eq!(table.get(0, 1), Some("london"));
+        assert_eq!(table.get(1, 1), Some("arlington"));
+
+        assert!(matches!(
+            table.remove_column(9),
+            Err(CoreError::NoSuchColumn {
+                column: 9,
+                columns: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn remove_column_skips_rows_shorter_than_the_index() {
+        let mut table = Table {
+            headers: headers(),
+            rows: vec![vec!["ada".into()], vec!["grace".into(), "admiral".into()]],
+        };
+
+        let removed = table.remove_column(1).unwrap();
+        assert_eq!(removed, "role");
+        // The short row never had the column, so it stays one cell wide.
+        assert_eq!(table.row(0).unwrap().to_vec(), vec!["ada".to_string()]);
+        assert_eq!(table.row(1).unwrap().to_vec(), vec!["grace".to_string()]);
+    }
+
+    #[test]
+    fn remove_row_returns_the_row_and_errors_out_of_range() {
+        let mut table = Table::new(
+            headers(),
+            vec![
+                vec!["ada".into(), "engineer".into()],
+                vec!["grace".into(), "admiral".into()],
+                vec!["alan".into(), "cryptanalyst".into()],
+            ],
+        );
+
+        let removed = table.remove_row(1).unwrap();
+        assert_eq!(removed, vec!["grace".to_string(), "admiral".to_string()]);
+        assert_eq!(table.row_count(), 2);
+        assert_eq!(table.get(1, 0), Some("alan"));
+        assert!(matches!(
+            table.remove_row(2),
+            Err(CoreError::NoSuchRow { row: 2, rows: 2 })
+        ));
+    }
+
+    #[test]
+    fn insert_row_on_an_empty_table_makes_a_zero_width_row() {
+        let mut table = Table::default();
+        assert!(table.is_empty());
+
+        assert_eq!(table.insert_row(0), 0);
+        assert_eq!(table.row_count(), 1);
+        assert_eq!(table.column_count(), 0);
+        assert!(table.row(0).unwrap().is_empty());
+
+        assert_eq!(table.insert_row(99), 1);
+        assert_eq!(table.row_count(), 2);
+    }
+
+    #[test]
+    fn insert_column_on_a_zero_column_table_gives_every_row_one_cell() {
+        let mut table = Table::default();
+        assert_eq!(table.insert_column(99, "name".into()), 0);
+        assert_eq!(table.column_count(), 1);
+        assert_eq!(table.header(0), Some("name"));
+        assert_eq!(table.row_count(), 0);
+
+        // Rows added afterwards inherit the new width.
+        table.insert_row(0);
+        assert_eq!(table.row(0).unwrap().len(), 1);
+
+        // A table whose rows predate its first column gets the cell too.
+        let mut rows_first = Table::default();
+        rows_first.insert_row(0);
+        rows_first.insert_row(1);
+        assert_eq!(rows_first.insert_column(0, "name".into()), 0);
+        assert_eq!(rows_first.row(0).unwrap().len(), 1);
+        assert_eq!(rows_first.row(1).unwrap().len(), 1);
     }
 }

@@ -62,6 +62,18 @@ pub fn scrollbar() -> Hsla {
     hsla(0.611, 0.08, 0.34, 1.0)
 }
 
+/// The wash behind a marked cell, row, or column. Translucent so the row's own
+/// background and the alternating stripes still read through it.
+pub fn selection() -> Hsla {
+    hsla(0.55, 0.70, 0.65, 0.16)
+}
+
+/// The wash behind the one cell that was clicked, which has to stand out from
+/// the row or column it sits in.
+pub fn selection_strong() -> Hsla {
+    hsla(0.55, 0.70, 0.65, 0.30)
+}
+
 /// The font for cell values and column headers.
 ///
 /// Values are monospaced so digit columns line up and can be compared by eye.

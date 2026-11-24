@@ -15,11 +15,13 @@
 
 mod csv;
 mod error;
+mod json;
 mod table;
 mod view;
 
 pub use csv::{CsvDocument, load_csv, parse_csv};
 pub use error::CoreError;
+pub use json::{JsonDocument, load_json, parse_json};
 pub use table::{Repairs, Table};
 pub use view::{Direction, RowView, SortKey, compare_values};
 
@@ -54,14 +56,27 @@ impl std::fmt::Display for Format {
     }
 }
 
+/// A file Bromine can show, already parsed by the engine for its format.
+///
+/// The engines do not know about each other, so this enum is the one place
+/// where a loaded file and the viewer that can draw it are matched up. A tab is
+/// built from the variant, which is why adding a format means one arm in
+/// [`load_document`] and one arm in the window, not a change to every caller.
+#[derive(Debug, Clone)]
+pub enum Document {
+    Csv(CsvDocument),
+    Json(JsonDocument),
+}
+
 /// Load whatever `path` holds, or explain why it cannot be shown.
 ///
 /// This is the only place that decides which format engine to use. Keeping the
 /// decision here means the command line and the window cannot disagree about
 /// what is supported, and that a new format is added in one place.
-pub fn load_document(path: &std::path::Path) -> Result<CsvDocument, CoreError> {
+pub fn load_document(path: &std::path::Path) -> Result<Document, CoreError> {
     match Format::from_path(path) {
-        Some(Format::Csv) => load_csv(path),
+        Some(Format::Csv) => load_csv(path).map(Document::Csv),
+        Some(Format::Json) => load_json(path).map(Document::Json),
         Some(format) => Err(CoreError::NotImplemented {
             path: path.to_path_buf(),
             format,
@@ -86,17 +101,54 @@ mod tests {
     #[test]
     fn a_csv_path_loads_through_the_dispatch() {
         let document = load_document(&fixture("people.csv")).expect("people.csv loads");
+        let Document::Csv(document) = document else {
+            panic!("a .csv path must dispatch to the CSV engine");
+        };
 
         assert_eq!(document.table.header(0), Some("name"));
         assert_eq!(document.table.row_count(), 6);
     }
 
     #[test]
+    fn an_empty_csv_still_dispatches_as_a_csv_document() {
+        let document = load_document(&fixture("empty.csv")).expect("empty.csv loads");
+        let Document::Csv(document) = document else {
+            panic!("an empty .csv path must still dispatch to the CSV engine");
+        };
+
+        assert_eq!(document.table.column_count(), 0);
+        assert_eq!(document.table.row_count(), 0);
+    }
+
+    #[test]
+    fn a_json_path_loads_through_the_dispatch() {
+        let directory =
+            std::env::temp_dir().join(format!("bromine-dispatch-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("the temporary directory is created");
+        let path = directory.join("person.json");
+        std::fs::write(&path, r#"{"name": "ada", "commits": 412}"#)
+            .expect("the JSON file is written");
+
+        let document = load_document(&path).expect("the JSON file loads");
+
+        std::fs::remove_dir_all(&directory).expect("the temporary directory is removed");
+
+        let Document::Json(document) = document else {
+            panic!("a .json path must dispatch to the JSON engine");
+        };
+        assert_eq!(document.value["name"], "ada");
+        assert!(document.pretty().contains("\"name\": \"ada\""));
+    }
+
+    #[test]
     fn a_known_format_without_a_viewer_says_not_yet_rather_than_never() {
-        let error = load_document(Path::new("package.json")).unwrap_err();
+        let error = load_document(Path::new("notes.md")).unwrap_err();
         let message = error.to_string();
 
-        assert!(message.contains("JSON"), "unexpected message: {message}");
+        assert!(
+            message.contains("Markdown"),
+            "unexpected message: {message}"
+        );
         assert!(
             message.contains("cannot show yet"),
             "unexpected message: {message}"

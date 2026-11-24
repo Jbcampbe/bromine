@@ -1,25 +1,70 @@
 //! The workspace: one tab per open document.
 //!
 //! The workspace owns the list of open documents and which one is visible. Each
-//! document is a [`CsvGrid`] entity, so a tab keeps its own sort and search
-//! state; switching tabs never reloads a file.
+//! document is an entity for its own kind of view, so a tab keeps its own sort,
+//! search, or scroll state; switching tabs never reloads a file.
 
 use std::path::{Path, PathBuf};
 
-use bromine_core::load_document;
+use bromine_core::{Document, load_document};
 use gpui::{
-    App, Context, Div, ElementId, Entity, FocusHandle, MouseButton, MouseDownEvent,
+    AnyElement, App, Context, Div, ElementId, Entity, FocusHandle, MouseButton, MouseDownEvent,
     PathPromptOptions, Render, SharedString, Window, actions, div, prelude::*, px,
 };
 
 use crate::csv_grid::CsvGrid;
+use crate::json_view::JsonView;
 use crate::theme;
 
 actions!(bromine, [OpenFile, CloseTab]);
 
+/// One open document, whichever viewer it needs.
+///
+/// The tab strip and the focus handling only ever need a path, a focus handle,
+/// and a dirty flag, so they ask the tab for those rather than matching on the
+/// variant themselves. [`Workspace::open`] is the only place that has to know
+/// how a [`Document`] becomes a view.
+pub(crate) enum TabView {
+    Csv(Entity<CsvGrid>),
+    Json(Entity<JsonView>),
+}
+
+impl TabView {
+    /// The file this tab shows.
+    fn path(&self, cx: &App) -> PathBuf {
+        match self {
+            Self::Csv(grid) => grid.read(cx).path().to_path_buf(),
+            Self::Json(view) => view.read(cx).path().to_path_buf(),
+        }
+    }
+
+    /// The handle that makes this tab's view the target of key events.
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        match self {
+            Self::Csv(grid) => grid.read(cx).focus_handle().clone(),
+            Self::Json(view) => view.read(cx).focus_handle().clone(),
+        }
+    }
+
+    fn focus(&self, window: &mut Window, cx: &App) {
+        match self {
+            Self::Csv(grid) => grid.read(cx).focus(window),
+            Self::Json(view) => view.read(cx).focus(window),
+        }
+    }
+
+    /// Whether this tab has edits that are not on disk yet.
+    fn is_dirty(&self, cx: &App) -> bool {
+        match self {
+            Self::Csv(grid) => grid.read(cx).is_dirty(),
+            Self::Json(view) => view.read(cx).is_dirty(),
+        }
+    }
+}
+
 /// The set of open documents and the visible one.
 pub struct Workspace {
-    tabs: Vec<Entity<CsvGrid>>,
+    tabs: Vec<TabView>,
     /// Index of the visible tab. Meaningless when `tabs` is empty, in which case
     /// it is kept at zero so indexing never needs a special case.
     active: usize,
@@ -28,6 +73,10 @@ pub struct Workspace {
     /// True while the open panel is up. macOS hands out a single shared
     /// `NSOpenPanel`, so a second prompt would reconfigure the one on screen.
     prompting: bool,
+    /// The tab the user asked to close while it had unsaved edits. Asking twice
+    /// discards them, because there is no undo behind this: one keystroke should
+    /// not be able to throw away work it never mentioned.
+    pending_close: Option<usize>,
     /// Focused only when no tab is open, so shortcuts still have a target.
     focus_handle: FocusHandle,
 }
@@ -40,8 +89,22 @@ impl Workspace {
             active: 0,
             error: None,
             prompting: false,
+            pending_close: None,
             focus_handle: cx.focus_handle(),
         }
+    }
+
+    /// Follow a new tab's notifications, so the tab strip redraws when the view
+    /// behind it changes: a title's dirty dot is read during the workspace's own
+    /// render, and a child's `cx.notify()` does not redraw its parent.
+    fn track<T: 'static>(&mut self, entity: &Entity<T>, cx: &mut Context<Self>) {
+        cx.observe(entity, |workspace: &mut Self, _, cx| {
+            // The view changed under the user, so any half-given close
+            // instruction is stale.
+            workspace.pending_close = None;
+            cx.notify();
+        })
+        .detach();
     }
 
     /// How many documents are open.
@@ -55,7 +118,7 @@ impl Workspace {
     }
 
     /// The visible document, if there is one.
-    pub fn active_tab(&self) -> Option<&Entity<CsvGrid>> {
+    pub(crate) fn active_tab(&self) -> Option<&TabView> {
         self.tabs.get(self.active)
     }
 
@@ -66,16 +129,14 @@ impl Workspace {
 
     /// The focus handle of the visible document, if there is one.
     pub fn active_focus_handle(&self, cx: &App) -> Option<FocusHandle> {
-        self.tabs
-            .get(self.active)
-            .map(|grid| grid.read(cx).focus_handle().clone())
+        self.tabs.get(self.active).map(|tab| tab.focus_handle(cx))
     }
 
     /// Give keyboard focus to the visible document, or to the workspace when
     /// nothing is open.
     pub fn focus_active(&self, window: &mut Window, cx: &App) {
-        match self.active_focus_handle(cx) {
-            Some(handle) => handle.focus(window),
+        match self.active_tab() {
+            Some(tab) => tab.focus(window, cx),
             None => self.focus_handle.focus(window),
         }
     }
@@ -96,20 +157,27 @@ impl Workspace {
         }
 
         match load_document(&path) {
-            Ok(document) => {
+            Ok(Document::Csv(document)) => {
                 let grid = cx.new(|cx| CsvGrid::new(path, document, cx));
-                self.tabs.push(grid);
-                self.active = self.tabs.len() - 1;
-                self.error = None;
-                cx.notify();
-                true
+                self.track(&grid, cx);
+                self.tabs.push(TabView::Csv(grid));
+            }
+            Ok(Document::Json(document)) => {
+                let view = cx.new(|cx| JsonView::new(path, document, cx));
+                self.track(&view, cx);
+                self.tabs.push(TabView::Json(view));
             }
             Err(error) => {
                 self.error = Some(SharedString::from(error.to_string()));
                 cx.notify();
-                false
+                return false;
             }
         }
+
+        self.active = self.tabs.len() - 1;
+        self.error = None;
+        cx.notify();
+        true
     }
 
     /// Show the tab at `index` and move keyboard focus into it.
@@ -117,6 +185,9 @@ impl Workspace {
         if index >= self.tabs.len() {
             return;
         }
+
+        // Moving away from a tab withdraws a close that was only warned about.
+        self.pending_close = None;
 
         if index != self.active {
             self.active = index;
@@ -126,9 +197,27 @@ impl Workspace {
     }
 
     /// Close the tab at `index` and show a neighbour.
+    ///
+    /// A tab with unsaved edits asks first: the request is recorded and answered
+    /// with a notice, and asking again for the same tab drops the edits. Nothing
+    /// here can undo a discard, so one keystroke must not be enough.
     pub fn close(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index >= self.tabs.len() {
             return;
+        }
+
+        if self.tabs[index].is_dirty(cx) && self.pending_close != Some(index) {
+            self.pending_close = Some(index);
+            self.error = Some(SharedString::from(
+                "this tab has unsaved changes: Cmd+S keeps them, closing it again discards them",
+            ));
+            cx.notify();
+            return;
+        }
+
+        // The notice was ours, so it goes with the tab that raised it.
+        if self.pending_close.take().is_some() {
+            self.error = None;
         }
 
         self.tabs.remove(index);
@@ -215,13 +304,13 @@ impl Workspace {
         let wanted = canonical(path);
         self.tabs
             .iter()
-            .position(|tab| canonical(tab.read(cx).path()) == wanted)
+            .position(|tab| canonical(&tab.path(cx)) == wanted)
     }
 
     fn tab_bar(&self, cx: &Context<Self>) -> Div {
         let mut tabs = Vec::with_capacity(self.tabs.len());
-        for (index, grid) in self.tabs.iter().enumerate() {
-            tabs.push(self.tab(index, grid, cx));
+        for (index, tab) in self.tabs.iter().enumerate() {
+            tabs.push(self.tab(index, tab, cx));
         }
 
         div()
@@ -258,9 +347,15 @@ impl Workspace {
             )
     }
 
-    fn tab(&self, index: usize, grid: &Entity<CsvGrid>, cx: &Context<Self>) -> Div {
+    fn tab(&self, index: usize, tab: &TabView, cx: &Context<Self>) -> Div {
         let visible = index == self.active;
-        let title = title_of(grid.read(cx).path());
+        // A dot marks edits that are not on disk yet. Only a CSV grid can be
+        // dirty today, so a JSON title never changes.
+        let title = if tab.is_dirty(cx) {
+            format!("{} \u{2022}", title_of(&tab.path(cx)))
+        } else {
+            title_of(&tab.path(cx))
+        };
 
         div()
             .flex()
@@ -374,7 +469,7 @@ impl Workspace {
                     .py_2()
                     .cursor_pointer()
                     .text_color(theme::accent())
-                    .child("Open a CSV file")
+                    .child("Open a file")
                     .on_click(
                         cx.listener(|this, _event, window, cx| this.request_open(window, cx)),
                     ),
@@ -382,14 +477,20 @@ impl Workspace {
     }
 
     fn body(&self, cx: &Context<Self>) -> Div {
-        match self.tabs.get(self.active) {
-            Some(grid) => div()
+        let content: Option<AnyElement> = match self.active_tab() {
+            Some(TabView::Csv(grid)) => Some(grid.clone().into_any_element()),
+            Some(TabView::Json(view)) => Some(view.clone().into_any_element()),
+            None => None,
+        };
+
+        match content {
+            Some(content) => div()
                 .flex_1()
                 .min_h(px(0.0))
                 .flex()
                 .flex_col()
                 .overflow_hidden()
-                .child(grid.clone()),
+                .child(content),
             None => self.empty_state(cx),
         }
     }
@@ -437,6 +538,7 @@ fn title_of(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bromine_core::parse_json;
     use gpui::{KeyBinding, Modifiers, TestAppContext, VisualTestContext};
 
     fn fixture(name: &str) -> PathBuf {
@@ -458,12 +560,22 @@ mod tests {
         workspace: &Entity<Workspace>,
         index: usize,
     ) -> Option<String> {
-        cx.update(|_window, app| {
-            workspace
-                .read(app)
-                .tabs
-                .get(index)
-                .map(|grid| grid.read(app).query().to_string())
+        cx.update(|_window, app| match workspace.read(app).tabs.get(index) {
+            Some(TabView::Csv(grid)) => Some(grid.read(app).query().to_string()),
+            _ => None,
+        })
+    }
+
+    /// How many lines the JSON tab at `index` draws, or `None` when that tab is
+    /// not a JSON view.
+    fn json_line_count(
+        cx: &mut VisualTestContext,
+        workspace: &Entity<Workspace>,
+        index: usize,
+    ) -> Option<usize> {
+        cx.update(|_window, app| match workspace.read(app).tabs.get(index) {
+            Some(TabView::Json(view)) => Some(view.read(app).line_count()),
+            _ => None,
         })
     }
 
@@ -577,6 +689,54 @@ mod tests {
     }
 
     #[gpui::test]
+    fn closing_a_tab_with_unsaved_edits_asks_before_it_discards_them(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(|_window, cx| Workspace::new(cx));
+
+        cx.update(|_window, app| {
+            workspace.update(app, |workspace, cx| {
+                workspace.open(fixture("people.csv"), cx)
+            });
+        });
+
+        // Give the grid an edit the way a user does: click its add-row button.
+        let button = cx
+            .debug_bounds("edit-insert-row")
+            .expect("the grid's add-row button was laid out");
+        cx.simulate_mouse_down(button.center(), MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(button.center(), MouseButton::Left, Modifiers::none());
+
+        assert!(
+            cx.update(|_window, app| workspace
+                .read(app)
+                .active_tab()
+                .is_some_and(|tab| tab.is_dirty(app))),
+            "the click should have left the tab dirty"
+        );
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| workspace.close(0, window, cx))
+        });
+        assert_eq!(
+            tab_count(cx, &workspace),
+            1,
+            "one close must not discard edits"
+        );
+        assert!(
+            cx.update(|_window, app| workspace.read(app).error().is_some()),
+            "the refusal has to say what happened"
+        );
+
+        cx.update(|window, app| {
+            workspace.update(app, |workspace, cx| workspace.close(0, window, cx))
+        });
+        assert_eq!(tab_count(cx, &workspace), 0, "asking twice discards them");
+        assert!(
+            cx.update(|_window, app| workspace.read(app).error().is_none()),
+            "the notice belonged to the tab that has now gone"
+        );
+    }
+
+    #[gpui::test]
     fn cmd_w_closes_the_visible_tab_through_the_keymap(cx: &mut TestAppContext) {
         let (workspace, cx) = cx.add_window_view(|_window, cx| Workspace::new(cx));
 
@@ -661,6 +821,78 @@ mod tests {
         assert_eq!(
             cx.update(|_window, app| workspace.read(app).error().map(str::to_string)),
             None
+        );
+    }
+
+    /// Write `source` to a temporary `.json` file and return the path.
+    ///
+    /// `fixtures/` is the contract between the engines, the views, and QA, so a
+    /// JSON document a test invents lives in the temporary directory instead.
+    fn temporary_json(name: &str, source: &str) -> PathBuf {
+        let directory =
+            std::env::temp_dir().join(format!("bromine-workspace-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("the temporary directory is created");
+        let path = directory.join(format!("{name}.json"));
+        std::fs::write(&path, source).expect("the JSON file is written");
+        path
+    }
+
+    #[gpui::test]
+    fn opening_a_json_file_creates_one_json_tab_showing_the_pretty_lines(cx: &mut TestAppContext) {
+        let source = r#"{"name": "ada", "roles": ["admin", "author"]}"#;
+        let path = temporary_json("json-tab", source);
+        // The same parser the workspace will use, so the expectation cannot
+        // drift from what the view draws.
+        let expected = parse_json(&path, source.to_string())
+            .expect("the inline JSON parses")
+            .line_count();
+
+        let (workspace, cx) = cx.add_window_view(|_window, cx| Workspace::new(cx));
+        let opened = cx.update(|_window, app| {
+            workspace.update(app, |workspace, cx| workspace.open(path.clone(), cx))
+        });
+
+        std::fs::remove_dir_all(path.parent().expect("the path has a directory"))
+            .expect("the temporary directory is removed");
+
+        assert!(opened);
+        assert_eq!(tab_count(cx, &workspace), 1);
+        assert_eq!(
+            json_line_count(cx, &workspace, 0),
+            Some(expected),
+            "the tab should be a JSON view drawing the formatted document"
+        );
+        // The CSV search box belongs to the grid, so a JSON tab has no query.
+        assert_eq!(query_of(cx, &workspace, 0), None);
+    }
+
+    #[gpui::test]
+    fn a_malformed_json_file_reports_where_it_broke_and_adds_no_tab(cx: &mut TestAppContext) {
+        let source = "{\"name\": }";
+        let path = temporary_json("malformed-json", source);
+        let expected = parse_json(&path, source.to_string())
+            .expect_err("the source is malformed")
+            .to_string();
+
+        let (workspace, cx) = cx.add_window_view(|_window, cx| Workspace::new(cx));
+        let opened = cx.update(|_window, app| {
+            workspace.update(app, |workspace, cx| workspace.open(path.clone(), cx))
+        });
+        let error = cx
+            .update(|_window, app| workspace.read(app).error().map(str::to_string))
+            .expect("a parse failure must be reported");
+
+        std::fs::remove_dir_all(path.parent().expect("the path has a directory"))
+            .expect("the temporary directory is removed");
+
+        assert!(!opened);
+        assert_eq!(tab_count(cx, &workspace), 0);
+        assert_eq!(error, expected);
+        // `CoreError::Json` prints `path:line:column`, which is the position a
+        // reader needs to jump to the offending byte.
+        assert!(
+            error.contains(&format!("{}:1:", path.display())),
+            "the reason should carry the broken position: {error}"
         );
     }
 }

@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 
 use bromine_core::{CsvDocument, Direction, RowView, SortKey};
 use gpui::{
-    Context, Div, ElementId, FocusHandle, Font, KeyDownEvent, MouseButton, MouseDownEvent, Pixels,
-    Render, ScrollHandle, ScrollWheelEvent, SharedString, Stateful, TextSystem, TouchPhase, Window,
-    div, font, point, prelude::*, px,
+    ClipboardItem, Context, Div, ElementId, FocusHandle, Font, KeyDownEvent, MouseButton,
+    MouseDownEvent, Pixels, Render, ScrollHandle, ScrollWheelEvent, SharedString, Stateful,
+    TextSystem, TouchPhase, Window, div, font, point, prelude::*, px,
 };
 
 /// The axis a scroll gesture is allowed to move.
@@ -18,6 +18,27 @@ enum Axis {
 }
 
 use crate::theme;
+
+/// What the user has marked, in Excel's terms.
+///
+/// A row or a column is held as the thing that was clicked rather than as a
+/// range of cells, because that is what copying and the row and column edits
+/// act on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Selection {
+    #[default]
+    None,
+    Cell {
+        position: usize,
+        column: usize,
+    },
+    Row {
+        position: usize,
+    },
+    Column {
+        column: usize,
+    },
+}
 
 /// Row height in pixels.
 ///
@@ -55,6 +76,13 @@ const SCROLLBAR_THICKNESS: f32 = 8.0;
 /// has a handle that can be seen.
 const MIN_SCROLLBAR_THUMB: f32 = 24.0;
 
+/// The width of the row-number gutter, in pixels. Wide enough for six digits of
+/// row number, which is further than any file this grid opens in one pass.
+const GUTTER_WIDTH: f32 = 56.0;
+
+/// The height of the strip of column letters above the header names.
+const LETTERS_HEIGHT: f32 = 20.0;
+
 /// A virtualized grid over a delimited file.
 ///
 /// The grid owns the parsed document plus a [`RowView`] that decides which rows
@@ -82,6 +110,16 @@ pub struct CsvGrid {
     /// native scroll container, which is what lets one wheel handler decide
     /// which axis a gesture moves.
     body_scroll: ScrollHandle,
+    /// Where the row numbers are scrolled to. They follow the rows vertically
+    /// and never move sideways, so they keep answering "which row is this"
+    /// while the table is panned.
+    gutter_scroll: ScrollHandle,
+    /// What the user has marked. Copying and the row and column edits read it.
+    selection: Selection,
+    /// Whether the table has edits that are not on disk yet.
+    dirty: bool,
+    /// Why the last save did not happen, shown in the status strip.
+    save_error: Option<SharedString>,
     focus_handle: FocusHandle,
 }
 
@@ -98,6 +136,10 @@ impl CsvGrid {
             header_scroll: ScrollHandle::new(),
             gesture_axis: None,
             body_scroll: ScrollHandle::new(),
+            gutter_scroll: ScrollHandle::new(),
+            selection: Selection::None,
+            dirty: false,
+            save_error: None,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -110,6 +152,11 @@ impl CsvGrid {
     /// The handle that makes the grid the target of key events.
     pub fn focus_handle(&self) -> &FocusHandle {
         &self.focus_handle
+    }
+
+    /// Whether the table has edits that are not on disk yet.
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
     }
 
     /// How many rows survive the current search.
@@ -153,14 +200,239 @@ impl CsvGrid {
         self.focus_handle.focus(window);
     }
 
+    /// Whether the cell at this position and column is inside the mark.
+    fn cell_is_selected(&self, position: usize, column: usize) -> bool {
+        match self.selection {
+            Selection::None => false,
+            Selection::Cell {
+                position: marked,
+                column: marked_column,
+            } => marked == position && marked_column == column,
+            Selection::Row { position: marked } => marked == position,
+            Selection::Column { column: marked } => marked == column,
+        }
+    }
+
+    /// Whether this is the one cell that was clicked, rather than a cell that
+    /// merely sits inside a marked row or column. The two get different washes
+    /// so the anchor of a highlighted row stays visible.
+    fn cell_is_focused(&self, position: usize, column: usize) -> bool {
+        matches!(
+            self.selection,
+            Selection::Cell {
+                position: marked,
+                column: marked_column,
+            } if marked == position && marked_column == column
+        )
+    }
+
+    /// Mark the row a row number was clicked for.
+    fn mark_row(&mut self, position: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus(window);
+        self.selection = Selection::Row { position };
+        cx.notify();
+    }
+
+    /// Mark the column a letter was clicked for.
+    fn mark_column(&mut self, column: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus(window);
+        self.selection = Selection::Column { column };
+        cx.notify();
+    }
+
+    /// Mark the cell under a click, using the click's window x.
+    ///
+    /// The row owns this rather than each cell: a cell is a plain div, and a few
+    /// hundred extra hitboxes per frame cost more than walking a few widths.
+    fn select_cell_at(&mut self, position: usize, x: Pixels, cx: &mut Context<Self>) {
+        let Some(column) = self.column_at(x) else {
+            return;
+        };
+        self.selection = Selection::Cell { position, column };
+        cx.notify();
+    }
+
+    /// The column whose band contains a window x, if any.
+    fn column_at(&self, x: Pixels) -> Option<usize> {
+        let left = f32::from(self.body_scroll.bounds().origin.x);
+        let offset = f32::from(self.body_scroll.offset().x);
+        let target = f32::from(x) - left - offset;
+        let mut edge = 0.0;
+
+        for (column, width) in self.column_widths.iter().enumerate() {
+            let next = edge + width;
+            if target < next {
+                return Some(column);
+            }
+            edge = next;
+        }
+
+        None
+    }
+
+    /// Move the mark one cell, turning any other kind of mark into a cell.
+    fn move_selection(&mut self, dx: isize, dy: isize, cx: &mut Context<Self>) {
+        let rows = self.view.len();
+        let columns = self.column_count();
+        if rows == 0 || columns == 0 {
+            return;
+        }
+
+        let (position, column) = match self.selection {
+            Selection::Cell { position, column } => (position, column),
+            Selection::Row { position } => (position, 0),
+            Selection::Column { column } => (0, column),
+            Selection::None => (0, 0),
+        };
+
+        self.selection = Selection::Cell {
+            position: (position as isize + dy).clamp(0, rows as isize - 1) as usize,
+            column: (column as isize + dx).clamp(0, columns as isize - 1) as usize,
+        };
+        cx.notify();
+    }
+
+    /// Copy the marked cell, row, or column to the clipboard.
+    ///
+    /// A row goes as tab-separated values and a column as one value per line,
+    /// which is what a spreadsheet or another editor pastes back into shape.
+    fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = self.selection_text() else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
+    /// The mark as text, or `None` when nothing is marked.
+    fn selection_text(&self) -> Option<String> {
+        match self.selection {
+            Selection::None => None,
+            Selection::Cell { position, column } => {
+                self.cell_at(position, column).map(str::to_string)
+            }
+            Selection::Row { position } => {
+                let row = self.view.table_row(position)?;
+                let cells = (0..self.column_count())
+                    .map(|column| self.document.table.get(row, column).unwrap_or_default())
+                    .collect::<Vec<_>>();
+                Some(cells.join("\t"))
+            }
+            Selection::Column { column } => {
+                let values = (0..self.view.len())
+                    .filter_map(|position| self.cell_at(position, column))
+                    .collect::<Vec<_>>();
+                Some(values.join("\n"))
+            }
+        }
+    }
+
+    /// Write the table back over the file it came from.
+    ///
+    /// A file that had to be decoded lossily cannot be written back without
+    /// destroying the bytes that would not decode, so it refuses instead of
+    /// quietly damaging the original. Padded and unnamed columns are repairs the
+    /// status strip already shows, and they write back as they look.
+    fn save(&mut self, cx: &mut Context<Self>) {
+        if self.document.lossy {
+            self.save_error = Some(SharedString::from(
+                "not saved: this file is not valid UTF-8, so writing it back would lose data",
+            ));
+            cx.notify();
+            return;
+        }
+
+        match self.document.save(&self.path) {
+            Ok(()) => {
+                self.dirty = false;
+                self.save_error = None;
+            }
+            Err(error) => self.save_error = Some(SharedString::from(error.to_string())),
+        }
+
+        cx.notify();
+    }
+
+    /// Insert an empty row below the marked one, or at the end of the file.
+    fn insert_row(&mut self, cx: &mut Context<Self>) {
+        let at = match self.selection {
+            Selection::Cell { position, .. } | Selection::Row { position } => self
+                .view
+                .table_row(position + 1)
+                .unwrap_or_else(|| self.total_row_count()),
+            _ => self.total_row_count(),
+        };
+
+        self.document.table.insert_row(at);
+        self.after_table_change(cx);
+    }
+
+    /// Remove the marked row, if one is marked.
+    fn delete_row(&mut self, cx: &mut Context<Self>) {
+        let position = match self.selection {
+            Selection::Cell { position, .. } | Selection::Row { position } => position,
+            _ => return,
+        };
+        let Some(row) = self.view.table_row(position) else {
+            return;
+        };
+
+        if self.document.table.remove_row(row).is_ok() {
+            self.after_table_change(cx);
+        }
+    }
+
+    /// Insert an empty column right of the marked one, or at the right edge.
+    fn insert_column(&mut self, cx: &mut Context<Self>) {
+        let index = match self.selection {
+            Selection::Cell { column, .. } | Selection::Column { column } => column + 1,
+            _ => self.column_count(),
+        };
+
+        self.document
+            .table
+            .insert_column(index, format!("column {}", index + 1));
+        self.after_table_change(cx);
+    }
+
+    /// Remove the marked column, if one is marked.
+    fn delete_column(&mut self, cx: &mut Context<Self>) {
+        let column = match self.selection {
+            Selection::Cell { column, .. } | Selection::Column { column } => column,
+            _ => return,
+        };
+
+        if self.document.table.remove_column(column).is_ok() {
+            self.after_table_change(cx);
+        }
+    }
+
+    /// Rebuild everything an edit has to keep in step.
+    ///
+    /// Widths are measured again because a new column has none and a removed one
+    /// must not leave its width behind. The mark is dropped because positions
+    /// and column indices no longer mean what they meant before the edit.
+    fn after_table_change(&mut self, cx: &mut Context<Self>) {
+        self.view.rebuild(&self.document.table);
+        self.column_widths = measure_columns(&self.document, cx.text_system());
+        self.selection = Selection::None;
+        self.dirty = true;
+        self.save_error = None;
+        cx.notify();
+    }
+
     /// Sort by `column`, or reverse the sort if it is already sorted by it.
     fn toggle_sort(&mut self, column: usize, cx: &mut Context<Self>) {
         self.view.toggle_sort(&self.document.table, column);
+        // Sorting moves rows, so a mark on a position would point at a different
+        // row than it did before the click.
+        self.selection = Selection::None;
         cx.notify();
     }
 
     fn set_query(&mut self, query: String, cx: &mut Context<Self>) {
         self.view.set_query(&self.document.table, query);
+        // Filtering hides rows, so a marked position may no longer exist.
+        self.selection = Selection::None;
         cx.notify();
     }
 
@@ -188,14 +460,33 @@ impl CsvGrid {
     /// characters, backspace, and escape cover searching, and nothing here
     /// claims to be a caret.
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        // Leave shortcuts to the platform and to whatever else is bound.
-        if event.keystroke.modifiers.platform || event.keystroke.modifiers.control {
+        let key = event.keystroke.key.as_str();
+
+        // The editing keys go first, and never into the search box.
+        if event.keystroke.modifiers.platform {
+            match key {
+                "c" => self.copy_selection(cx),
+                "s" => self.save(cx),
+                _ => {}
+            }
             return;
         }
 
-        match event.keystroke.key.as_str() {
+        // Leave control shortcuts to the platform and to whatever else is bound.
+        if event.keystroke.modifiers.control {
+            return;
+        }
+
+        match key {
             "backspace" => self.delete_last_query_char(cx),
-            "escape" => self.clear_query(cx),
+            "escape" => {
+                self.selection = Selection::None;
+                self.clear_query(cx);
+            }
+            "up" => self.move_selection(0, -1, cx),
+            "down" => self.move_selection(0, 1, cx),
+            "left" => self.move_selection(-1, 0, cx),
+            "right" => self.move_selection(1, 0, cx),
             _ => {
                 if let Some(text) = event.keystroke.key_char.as_deref()
                     && !text.is_empty()
@@ -238,10 +529,11 @@ impl CsvGrid {
         (!parts.is_empty()).then(|| parts.join(", "))
     }
 
-    /// The counts and repair notice, along the bottom of the grid.
+    /// The counts, the row and column edits, and the repair notice, along the
+    /// bottom of the grid.
     ///
     /// The file name is not repeated here: the tab above the grid carries it.
-    fn status_bar(&self) -> Div {
+    fn status_bar(&self, cx: &Context<Self>) -> Div {
         let total = self.total_row_count();
         let columns = self.column_count();
         let counts = if self.view.len() == total {
@@ -267,9 +559,13 @@ impl CsvGrid {
                     .text_color(theme::text_muted())
                     .child(SharedString::from(counts)),
             )
-            // The counts stay left and the notice stays right however wide the
+            // The counts stay left and the state stays right however wide the
             // window is.
-            .child(div().flex_1());
+            .child(div().flex_1())
+            .child(self.edit_button("insert-row", "+ row", Self::insert_row, cx))
+            .child(self.edit_button("delete-row", "- row", Self::delete_row, cx))
+            .child(self.edit_button("insert-column", "+ col", Self::insert_column, cx))
+            .child(self.edit_button("delete-column", "- col", Self::delete_column, cx));
 
         if let Some(notice) = self.repairs_notice() {
             bar = bar.child(
@@ -280,12 +576,43 @@ impl CsvGrid {
             );
         }
 
+        if let Some(error) = self.save_error.clone() {
+            bar = bar.child(div().text_xs().text_color(theme::warning()).child(error));
+        }
+
         bar.child(
             div()
                 .text_xs()
-                .text_color(theme::text_muted())
-                .child("read only"),
+                .text_color(if self.dirty {
+                    theme::warning()
+                } else {
+                    theme::text_muted()
+                })
+                .child(SharedString::from(if self.dirty {
+                    "unsaved changes"
+                } else {
+                    "saved"
+                })),
         )
+    }
+
+    /// One of the row and column buttons in the status strip.
+    fn edit_button(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        action: impl Fn(&mut Self, &mut Context<Self>) + 'static,
+        cx: &Context<Self>,
+    ) -> Stateful<Div> {
+        div()
+            .id(id)
+            .debug_selector(move || format!("edit-{id}"))
+            .px_2()
+            .cursor_pointer()
+            .text_xs()
+            .text_color(theme::accent())
+            .child(label)
+            .on_click(cx.listener(move |this, _event, _window, cx| action(this, cx)))
     }
 
     fn search_bar(&self, cx: &Context<Self>) -> Div {
@@ -380,17 +707,53 @@ impl CsvGrid {
             .relative()
             .overflow_hidden()
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
-            .child(self.header_viewport(cx))
-            .child(self.rows_viewport())
+            .child(self.letters_strip(cx))
+            .child(self.names_strip(cx))
+            .child(self.gutter_viewport(cx))
+            .child(self.rows_viewport(cx))
             .children(self.scrollbars())
     }
 
-    /// The column headers, clipped and moved sideways with the rows.
+    /// The Excel-style letters above the header names.
+    ///
+    /// They mark a column; the names below sort by one. Both strips track the
+    /// same handle, so they cannot disagree about how far the table is panned.
+    fn letters_strip(&self, cx: &Context<Self>) -> Stateful<Div> {
+        let mut cells = Vec::with_capacity(self.column_widths.len());
+        for (column, width) in self.column_widths.iter().enumerate() {
+            cells.push(self.letter_cell(column, *width, cx));
+        }
+
+        div()
+            .id("grid-letters-scroll")
+            .debug_selector(|| "grid-letters".to_string())
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .right(px(0.0))
+            .h(px(LETTERS_HEIGHT))
+            .overflow_hidden()
+            .bg(theme::surface())
+            .border_b_1()
+            .border_color(theme::border_subtle())
+            .track_scroll(&self.header_scroll)
+            .child(
+                div()
+                    .w(px(self.total_width() + GUTTER_WIDTH))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .child(self.corner(LETTERS_HEIGHT))
+                    .children(cells),
+            )
+    }
+
+    /// The column names, clipped and moved sideways with the rows.
     ///
     /// A tracked handle on a hidden-overflow element clips and translates its
     /// children without registering a wheel listener of its own, so the header
     /// follows the rows without competing for the gesture that moves them.
-    fn header_viewport(&self, cx: &Context<Self>) -> Stateful<Div> {
+    fn names_strip(&self, cx: &Context<Self>) -> Stateful<Div> {
         let mut cells = Vec::with_capacity(self.column_widths.len());
         for (column, width) in self.column_widths.iter().enumerate() {
             cells.push(self.header_cell(column, *width, cx));
@@ -400,6 +763,11 @@ impl CsvGrid {
         // content, so a table narrower than the window still paints edge to edge.
         div()
             .id("grid-header-scroll")
+            .debug_selector(|| "grid-header".to_string())
+            .absolute()
+            .top(px(LETTERS_HEIGHT))
+            .left(px(0.0))
+            .right(px(0.0))
             .h(px(HEADER_HEIGHT))
             .overflow_hidden()
             .bg(theme::surface())
@@ -408,41 +776,143 @@ impl CsvGrid {
             .track_scroll(&self.header_scroll)
             .child(
                 div()
-                    .w(px(self.total_width()))
+                    .w(px(self.total_width() + GUTTER_WIDTH))
                     .flex()
                     .flex_row()
                     .items_center()
+                    .child(self.corner(HEADER_HEIGHT))
                     .children(cells),
             )
     }
 
-    /// The data rows, drawn for the part of the file that is in view.
-    ///
-    /// `uniform_list` used to do this, but it owns its own wheel handling and
-    /// cannot be told to leave an axis alone. Rendering the visible slice by
-    /// hand keeps the virtualization and hands scrolling to a single owner.
-    fn rows_viewport(&self) -> Stateful<Div> {
-        // Absolute insets rather than `flex_1`: a flex item whose container has
-        // no definite height during layout takes its content's height instead of
-        // the space left over, which would make the viewport as tall as the file.
+    /// The blank square where the row numbers meet the column headers.
+    fn corner(&self, height: f32) -> Div {
+        div()
+            .w(px(GUTTER_WIDTH))
+            .flex_shrink_0()
+            .h(px(height))
+            .border_r_1()
+            .border_color(theme::border())
+    }
+
+    /// One column letter. Clicking it marks the column, which is the one thing
+    /// the name below it does not already do.
+    fn letter_cell(&self, column: usize, width: f32, cx: &Context<Self>) -> Stateful<Div> {
+        let marked = match self.selection {
+            Selection::Column { column: marked } => marked == column,
+            Selection::Cell { column: marked, .. } => marked == column,
+            _ => false,
+        };
+
+        div()
+            .id(ElementId::named_usize("letter", column))
+            .debug_selector({
+                let selector = format!("letter-{column}");
+                move || selector
+            })
+            .w(px(width))
+            .flex_shrink_0()
+            .h(px(LETTERS_HEIGHT))
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(px(CELL_FONT_SIZE - 1.0))
+            .cursor_pointer()
+            .text_color(theme::text_muted())
+            .when(marked, |el| {
+                el.bg(theme::selection()).text_color(theme::accent())
+            })
+            .child(SharedString::from(column_label(column)))
+            .on_click(
+                cx.listener(move |this, _event, window, cx| this.mark_column(column, window, cx)),
+            )
+    }
+
+    /// The row numbers down the left edge, which never scroll sideways.
+    fn gutter_viewport(&self, cx: &Context<Self>) -> Stateful<Div> {
+        let rows = self.view.len();
         let viewport = div()
-            .id("grid-scroll")
-            .debug_selector(|| "grid-scroll".to_string())
+            .id("grid-gutter")
+            .debug_selector(|| "grid-gutter".to_string())
             .absolute()
-            .top(px(HEADER_HEIGHT))
+            .top(px(LETTERS_HEIGHT + HEADER_HEIGHT))
             .bottom(px(0.0))
             .left(px(0.0))
-            .right(px(0.0))
+            .w(px(GUTTER_WIDTH))
             .overflow_hidden()
-            .track_scroll(&self.body_scroll);
+            .bg(theme::surface())
+            .border_r_1()
+            .border_color(theme::border())
+            .track_scroll(&self.gutter_scroll);
 
+        if rows == 0 {
+            return viewport;
+        }
+
+        // The same window of rows the cells draw, so a number can never end up
+        // beside a row it does not describe.
+        let (first, last) = self.row_window();
+        let mut cells = Vec::with_capacity(last.saturating_sub(first));
+        for position in first..last {
+            cells.push(self.number_cell(position, cx));
+        }
+
+        viewport.child(
+            div()
+                .relative()
+                .flex_shrink_0()
+                .w(px(GUTTER_WIDTH))
+                .h(px(rows as f32 * ROW_HEIGHT))
+                .children(cells),
+        )
+    }
+
+    /// One row number, counting from one the way every tool that shows a row
+    /// count does.
+    fn number_cell(&self, position: usize, cx: &Context<Self>) -> Stateful<Div> {
+        let marked = match self.selection {
+            Selection::Row { position: marked } => marked == position,
+            Selection::Cell {
+                position: marked, ..
+            } => marked == position,
+            _ => false,
+        };
+
+        div()
+            .id(ElementId::named_usize("row-number", position))
+            .debug_selector({
+                let selector = format!("row-number-{position}");
+                move || selector
+            })
+            .absolute()
+            .top(px(position as f32 * ROW_HEIGHT))
+            .left(px(0.0))
+            .w(px(GUTTER_WIDTH))
+            .h(px(ROW_HEIGHT))
+            .flex()
+            .items_center()
+            .justify_center()
+            .font_family(theme::monospace())
+            .text_size(px(CELL_FONT_SIZE - 1.0))
+            .cursor_pointer()
+            .text_color(theme::text_muted())
+            .when(marked, |el| {
+                el.bg(theme::selection()).text_color(theme::accent())
+            })
+            .child(SharedString::from((position + 1).to_string()))
+            .on_click(
+                cx.listener(move |this, _event, window, cx| this.mark_row(position, window, cx)),
+            )
+    }
+
+    /// The visible slice of rows, as positions into the view.
+    ///
+    /// The numbers and the cells have to agree on this window, so both ask for
+    /// it here rather than each deriving it.
+    fn row_window(&self) -> (usize, usize) {
         let rows = self.view.len();
         if rows == 0 {
-            return viewport
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(div().text_color(theme::text_muted()).child("no rows match"));
+            return (0, 0);
         }
 
         // Bounds are known only after a frame has been laid out. Until then draw
@@ -458,10 +928,41 @@ impl CsvGrid {
         let offset = f32::from(self.body_scroll.offset().y);
         let first = (((-offset) / ROW_HEIGHT).floor().max(0.0) as usize).min(rows - 1);
         let drawn = (viewport_height / ROW_HEIGHT).ceil() as usize + 1;
-        let last = (first + drawn).min(rows);
+        (first, (first + drawn).min(rows))
+    }
 
+    /// The data rows, drawn for the part of the file that is in view.
+    ///
+    /// `uniform_list` used to do this, but it owns its own wheel handling and
+    /// cannot be told to leave an axis alone. Rendering the visible slice by
+    /// hand keeps the virtualization and hands scrolling to a single owner.
+    fn rows_viewport(&self, cx: &Context<Self>) -> Stateful<Div> {
+        // Absolute insets rather than `flex_1`: a flex item whose container has
+        // no definite height during layout takes its content's height instead of
+        // the space left over, which would make the viewport as tall as the file.
+        let viewport = div()
+            .id("grid-scroll")
+            .debug_selector(|| "grid-scroll".to_string())
+            .absolute()
+            .top(px(LETTERS_HEIGHT + HEADER_HEIGHT))
+            .bottom(px(0.0))
+            .left(px(GUTTER_WIDTH))
+            .right(px(0.0))
+            .overflow_hidden()
+            .track_scroll(&self.body_scroll);
+
+        let rows = self.view.len();
+        if rows == 0 {
+            return viewport
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(div().text_color(theme::text_muted()).child("no rows match"));
+        }
+
+        let (first, last) = self.row_window();
         let visible = (first..last)
-            .map(|position| self.row(position, position as f32 * ROW_HEIGHT))
+            .map(|position| self.row(position, position as f32 * ROW_HEIGHT, cx))
             .collect::<Vec<_>>();
 
         // The content box is what the scroll handles measure themselves
@@ -529,8 +1030,12 @@ impl CsvGrid {
             return;
         }
 
-        // The header shares the horizontal offset and never moves vertically.
+        // The header shares the horizontal offset and the row numbers share the
+        // vertical one, and neither moves on the axis it does not own. Without
+        // this the numbers would keep answering for the rows that were in view
+        // when the file opened, which is worse than showing none.
         self.header_scroll.set_offset(point(next.x, px(0.0)));
+        self.gutter_scroll.set_offset(point(px(0.0), next.y));
         self.body_scroll.set_offset(next);
         cx.notify();
     }
@@ -643,7 +1148,7 @@ impl CsvGrid {
             .on_click(cx.listener(move |this, _event, _window, cx| this.toggle_sort(column, cx)))
     }
 
-    fn row(&self, position: usize, top: f32) -> Stateful<Div> {
+    fn row(&self, position: usize, top: f32, cx: &Context<Self>) -> Stateful<Div> {
         let table = &self.document.table;
         let row = self.view.table_row(position);
         let mut cells = Vec::with_capacity(table.column_count());
@@ -666,6 +1171,12 @@ impl CsvGrid {
                     .overflow_hidden()
                     .border_r_1()
                     .border_color(theme::border_subtle())
+                    .when(self.cell_is_selected(position, column), |el| {
+                        el.bg(theme::selection())
+                    })
+                    .when(self.cell_is_focused(position, column), |el| {
+                        el.bg(theme::selection_strong())
+                    })
                     .child(
                         div()
                             .w_full()
@@ -693,6 +1204,15 @@ impl CsvGrid {
             .w(px(self.total_width()))
             .h(px(ROW_HEIGHT))
             .when(position % 2 == 1, |el| el.bg(theme::row_alternate()))
+            // One listener per row rather than one per cell: a cell is a plain
+            // div, and marking a cell only needs the column the click fell in.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    this.focus(window);
+                    this.select_cell_at(position, event.position.x, cx);
+                }),
+            )
             .children(cells)
     }
 }
@@ -715,7 +1235,7 @@ impl Render for CsvGrid {
             )
             .child(self.search_bar(cx))
             .child(self.body(cx))
-            .child(self.status_bar())
+            .child(self.status_bar(cx))
     }
 }
 
@@ -813,6 +1333,23 @@ fn thumb_length(track: f32, overflow: f32) -> f32 {
     (track * visible).max(MIN_SCROLLBAR_THUMB).min(track)
 }
 
+/// Excel's column labels: A to Z, then AA, AB, and so on.
+///
+/// The labels a reader expects come from the same sequence a spreadsheet uses,
+/// so the seventh column of a narrow table is `G` rather than `7`.
+fn column_label(column: usize) -> String {
+    let mut label = String::new();
+    let mut index = column + 1;
+
+    while index > 0 {
+        let remainder = (index - 1) % 26;
+        label.insert(0, (b'A' + remainder as u8) as char);
+        index = (index - 1) / 26;
+    }
+
+    label
+}
+
 fn plural(count: usize) -> &'static str {
     if count == 1 { "" } else { "s" }
 }
@@ -820,7 +1357,7 @@ fn plural(count: usize) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bromine_core::parse_csv;
+    use bromine_core::{load_csv, parse_csv};
     use gpui::{
         Entity, Modifiers, Point, ScrollDelta, TestAppContext, TouchPhase, VisualTestContext,
     };
@@ -1299,7 +1836,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn the_counts_and_read_only_notice_sit_below_the_grid(cx: &mut TestAppContext) {
+    fn the_counts_and_state_sit_below_the_grid(cx: &mut TestAppContext) {
         let (_grid, cx) = grid(cx);
 
         let viewport = cx
@@ -1314,6 +1851,293 @@ mod tests {
             "the status bar is at {} but the grid ends at {}",
             status.origin.y,
             viewport.bottom()
+        );
+    }
+
+    /// Click the centre of an element, the way a pointer would.
+    fn click(cx: &mut VisualTestContext, selector: &'static str) {
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} was not laid out"));
+        let centre = bounds.center();
+        cx.simulate_mouse_down(centre, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(centre, MouseButton::Left, Modifiers::none());
+    }
+
+    /// Click inside an element, `dx` pixels from its left edge.
+    fn click_at(cx: &mut VisualTestContext, selector: &'static str, dx: f32) {
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} was not laid out"));
+        let position = point(bounds.origin.x + px(dx), bounds.center().y);
+        cx.simulate_mouse_down(position, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(position, MouseButton::Left, Modifiers::none());
+    }
+
+    fn mark(cx: &mut VisualTestContext, grid: &Entity<CsvGrid>) -> Selection {
+        cx.update(|_window, app| grid.read(app).selection)
+    }
+
+    fn clipboard_text(cx: &mut VisualTestContext) -> Option<String> {
+        cx.read_from_clipboard().and_then(|item| item.text())
+    }
+
+    #[test]
+    fn column_letters_run_from_a_to_z_then_double_up() {
+        assert_eq!(column_label(0), "A");
+        assert_eq!(column_label(25), "Z");
+        assert_eq!(column_label(26), "AA");
+        assert_eq!(column_label(51), "AZ");
+        assert_eq!(column_label(52), "BA");
+        assert_eq!(column_label(701), "ZZ");
+        assert_eq!(column_label(702), "AAA");
+    }
+
+    #[gpui::test]
+    fn every_row_has_a_number_and_every_column_has_a_letter(cx: &mut TestAppContext) {
+        let (_grid, cx) = grid(cx);
+
+        let first = cx
+            .debug_bounds("row-number-0")
+            .expect("the first row number was laid out");
+        let third = cx
+            .debug_bounds("row-number-2")
+            .expect("the third row number was laid out");
+        let letters = cx
+            .debug_bounds("letter-0")
+            .expect("the first column letter was laid out");
+        let second = cx
+            .debug_bounds("letter-1")
+            .expect("the second column letter was laid out");
+        let row = cx
+            .debug_bounds("row-0")
+            .expect("the first row was laid out");
+        let header = cx
+            .debug_bounds("header-0")
+            .expect("the first header was laid out");
+
+        // One number per row, one row tall apart.
+        assert_eq!(third.origin.y - first.origin.y, px(ROW_HEIGHT * 2.0));
+        // The numbers sit beside the data, not on top of it.
+        assert!(
+            first.right() <= row.origin.x,
+            "the gutter at {} runs into the cells at {}",
+            first.right(),
+            row.origin.x
+        );
+        // Letters share the cells' left edges, which is the only reason they are
+        // safe to read as a column label.
+        assert_eq!(letters.origin.x, header.origin.x);
+        assert!(second.origin.x > letters.origin.x);
+    }
+
+    #[gpui::test]
+    fn clicking_a_row_number_or_a_letter_marks_that_row_or_column(cx: &mut TestAppContext) {
+        let (grid, cx) = grid(cx);
+
+        click(cx, "row-number-1");
+        assert_eq!(mark(cx, &grid), Selection::Row { position: 1 });
+
+        click(cx, "letter-1");
+        assert_eq!(mark(cx, &grid), Selection::Column { column: 1 });
+    }
+
+    #[gpui::test]
+    fn clicking_a_cell_marks_it(cx: &mut TestAppContext) {
+        let (grid, cx) = grid(cx);
+        let first_width = cx.update(|_window, app| grid.read(app).column_widths[0]);
+
+        click_at(cx, "row-1", 10.0);
+        assert_eq!(
+            mark(cx, &grid),
+            Selection::Cell {
+                position: 1,
+                column: 0
+            }
+        );
+
+        click_at(cx, "row-1", first_width + 10.0);
+        assert_eq!(
+            mark(cx, &grid),
+            Selection::Cell {
+                position: 1,
+                column: 1
+            }
+        );
+    }
+
+    #[gpui::test]
+    fn cmd_c_copies_the_marked_cell_row_or_column(cx: &mut TestAppContext) {
+        let (grid, cx) = grid(cx);
+        focus(cx, &grid);
+
+        click_at(cx, "row-1", 10.0);
+        cx.simulate_keystrokes("cmd-c");
+        assert_eq!(clipboard_text(cx).as_deref(), Some("grace"));
+
+        click(cx, "row-number-2");
+        cx.simulate_keystrokes("cmd-c");
+        assert_eq!(clipboard_text(cx).as_deref(), Some("alan\t1337"));
+
+        click(cx, "letter-1");
+        cx.simulate_keystrokes("cmd-c");
+        assert_eq!(clipboard_text(cx).as_deref(), Some("412\n88\n1337"));
+    }
+
+    #[gpui::test]
+    fn arrow_keys_move_the_mark_one_cell_at_a_time(cx: &mut TestAppContext) {
+        let (grid, cx) = grid(cx);
+        focus(cx, &grid);
+
+        cx.simulate_keystrokes("down");
+        assert_eq!(
+            mark(cx, &grid),
+            Selection::Cell {
+                position: 1,
+                column: 0
+            }
+        );
+
+        cx.simulate_keystrokes("right right");
+        assert_eq!(
+            mark(cx, &grid),
+            Selection::Cell {
+                position: 1,
+                column: 1
+            },
+            "the right edge must stop rather than fall off the table"
+        );
+
+        cx.simulate_keystrokes("up up");
+        assert_eq!(
+            mark(cx, &grid),
+            Selection::Cell {
+                position: 0,
+                column: 1
+            }
+        );
+    }
+
+    #[gpui::test]
+    fn the_status_strip_adds_and_removes_rows_and_columns(cx: &mut TestAppContext) {
+        let (grid, cx) = grid(cx);
+
+        click(cx, "edit-insert-row");
+        assert_eq!(visible_rows(cx, &grid), 4);
+        assert!(cx.update(|_window, app| grid.read(app).dirty));
+        draw(cx);
+
+        click(cx, "row-number-0");
+        click(cx, "edit-delete-row");
+        assert_eq!(visible_rows(cx, &grid), 3);
+        draw(cx);
+
+        click(cx, "edit-insert-column");
+        assert_eq!(cx.update(|_window, app| grid.read(app).column_count()), 3);
+        draw(cx);
+
+        click(cx, "letter-2");
+        click(cx, "edit-delete-column");
+        assert_eq!(cx.update(|_window, app| grid.read(app).column_count()), 2);
+    }
+
+    #[gpui::test]
+    fn an_edit_marks_the_document_dirty_and_cmd_s_writes_it_back(cx: &mut TestAppContext) {
+        let directory = std::env::temp_dir().join(format!("bromine-save-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("the temporary directory is created");
+        let path = directory.join("edits.csv");
+        std::fs::write(&path, "name,commits\nada,412\n").expect("the fixture is written");
+
+        let (grid, cx) = cx.add_window_view(|_window, cx| {
+            let document = load_csv(&path).expect("the fixture loads");
+            CsvGrid::new(path.clone(), document, cx)
+        });
+        focus(cx, &grid);
+
+        click(cx, "edit-insert-row");
+        assert_eq!(visible_rows(cx, &grid), 2);
+        assert!(cx.update(|_window, app| grid.read(app).dirty));
+
+        cx.simulate_keystrokes("cmd-s");
+
+        assert!(!cx.update(|_window, app| grid.read(app).dirty));
+        let reloaded = load_csv(&path).expect("the saved file still loads");
+        assert_eq!(reloaded.table.row_count(), 2);
+        assert_eq!(reloaded.table.get(0, 1), Some("412"));
+
+        std::fs::remove_dir_all(&directory).expect("the temporary directory is removed");
+    }
+
+    #[gpui::test]
+    fn a_lossily_decoded_file_is_not_written_back(cx: &mut TestAppContext) {
+        let directory = std::env::temp_dir().join(format!("bromine-lossy-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("the temporary directory is created");
+        let path = directory.join("lossy.csv");
+        let original = b"name,commits\nada,412\n".to_vec();
+        std::fs::write(&path, &original).expect("the fixture is written");
+
+        let (grid, cx) = cx.add_window_view(|_window, cx| {
+            let mut document = load_csv(&path).expect("the fixture loads");
+            document.lossy = true;
+            CsvGrid::new(path.clone(), document, cx)
+        });
+        focus(cx, &grid);
+
+        click(cx, "edit-insert-row");
+        cx.simulate_keystrokes("cmd-s");
+
+        assert!(
+            cx.update(|_window, app| grid.read(app).save_error.is_some()),
+            "a lossy document must say why it did not save"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("the file is readable"),
+            original,
+            "a lossy document must leave the file alone"
+        );
+
+        std::fs::remove_dir_all(&directory).expect("the temporary directory is removed");
+    }
+
+    #[gpui::test]
+    fn the_row_numbers_follow_the_rows_and_never_move_sideways(cx: &mut TestAppContext) {
+        let (_grid, cx) = tall_grid(cx);
+        hover_the_grid(cx);
+
+        cx.simulate_event(wheel(0.0, -480.0));
+        draw(cx);
+
+        let number = cx
+            .debug_bounds("row-number-20")
+            .expect("the twentieth row number is in view");
+        let row = cx
+            .debug_bounds("row-20")
+            .expect("the twentieth row is in view");
+        assert_eq!(
+            number.origin.y, row.origin.y,
+            "the number and its row must share a top edge"
+        );
+
+        // Sideways movement belongs to the cells, not to the gutter. A new
+        // gesture rather than a continued one, because a gesture keeps the axis
+        // it started on.
+        cx.simulate_event(wheel_with(-240.0, 0.0, TouchPhase::Started));
+        draw(cx);
+
+        let after = cx
+            .debug_bounds("row-number-20")
+            .expect("the number is still in view");
+        assert_eq!(
+            after.origin.x, number.origin.x,
+            "the gutter must not pan with the cells"
+        );
+        assert_eq!(after.origin.y, number.origin.y);
+
+        let moved = cx.debug_bounds("row-20").expect("the row is still in view");
+        assert_eq!(
+            moved.origin.x,
+            row.origin.x - px(240.0),
+            "the cells should have panned while the numbers held still"
         );
     }
 }

@@ -16,6 +16,11 @@ anyhow = "1"
 csv = "1.4"
 thiserror = "2"
 
+# `preserve_order` is a correctness requirement, not a nicety: a JSON viewer
+# that silently re-sorts keys alphabetically shows the user a document that is
+# not the one on disk, and formatting would destroy the original order.
+serde_json = { version = "1", features = ["preserve_order"] }
+
 # GPUI is pre-1.0 and the API moves between releases, so the version is pinned
 # exactly. `runtime_shaders` compiles GPUI's Metal shaders at startup instead of
 # build time, which removes the build dependency on Xcode's `metal`/`metallib`

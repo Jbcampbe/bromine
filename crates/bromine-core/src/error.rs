@@ -22,6 +22,19 @@ pub enum CoreError {
     #[error("malformed CSV: {0}")]
     Csv(#[from] csv::Error),
 
+    /// A JSON document did not parse. The position is carried on the variant
+    /// rather than folded into the message because a viewer wants to jump to
+    /// the offending line, and a caller should not have to parse a string to
+    /// find out where the problem is. `serde_json` already tracks the byte
+    /// position while it scans, so it is reported rather than guessed at.
+    #[error("{path}:{line}:{column}: {message}")]
+    Json {
+        path: PathBuf,
+        line: usize,
+        column: usize,
+        message: String,
+    },
+
     #[error("column {column} does not exist (table has {columns} columns)")]
     NoSuchColumn { column: usize, columns: usize },
 

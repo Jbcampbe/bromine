@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use bromine_core::{Direction, RowView, Table, load_csv, parse_csv};
+use bromine_core::{CoreError, Direction, RowView, Table, load_csv, load_json, parse_csv};
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -135,4 +135,54 @@ fn a_table_never_reports_a_cell_outside_its_bounds() {
     assert_eq!(table.get(6, 0), None);
     assert_eq!(table.get(0, 4), None);
     assert_eq!(table.get(99, 99), None);
+}
+
+#[test]
+fn config_json_keeps_the_key_order_it_was_written_in() {
+    let document = load_json(&fixture("config.json")).unwrap();
+    let object = document
+        .value
+        .as_object()
+        .expect("the fixture is an object");
+    let keys = object.keys().map(String::as_str).collect::<Vec<_>>();
+
+    // Alphabetical order would be apple, empty_array, empty_object, ... so the
+    // first two keys are the whole test: a formatter that sorts is caught here
+    // rather than by a reader who has to diff the file to notice.
+    assert_eq!(keys.first().copied(), Some("zebra"));
+    assert_eq!(keys.get(1).copied(), Some("apple"));
+
+    // Formatting changes whitespace and nothing else.
+    assert!(document.pretty().lines().count() > 10);
+    assert!(!document.minified().contains('\n'));
+    assert!(document.minified().starts_with(r#"{"zebra":1,"apple":"#));
+}
+
+#[test]
+fn broken_json_says_what_and_where() {
+    let error = load_json(&fixture("broken.json")).unwrap_err();
+
+    let CoreError::Json {
+        line,
+        message,
+        path,
+        ..
+    } = &error
+    else {
+        panic!("expected a JSON parse error, got {error:?}");
+    };
+
+    assert_eq!(
+        line, &5,
+        "the trailing comma is caught at the closing brace"
+    );
+    assert!(
+        path.ends_with("broken.json"),
+        "the error names the file: {path:?}"
+    );
+    assert!(
+        !message.contains(" at line "),
+        "the position would be printed twice: {message}"
+    );
+    assert!(error.to_string().contains(":5:"), "display was {error}");
 }

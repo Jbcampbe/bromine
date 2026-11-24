@@ -13,7 +13,8 @@ framework).
 - Test everything: `cargo test --workspace`
 - Format: `cargo fmt --all`
 - Lint: `cargo clippy --workspace --all-targets -- -D warnings`
-- Generate a large fixture for grid work: `./scripts/make-large-fixture.sh 200000`
+- Generate large fixtures for grid and JSON work: `./scripts/make-large-fixture.sh 200000`
+  (writes `large.csv` and a compact one-record-per-line `large.json`)
 
 ### Build times are long, and the wait is silent
 
@@ -142,6 +143,41 @@ them after an upgrade.
   first and dispatches the action; `on_key_down` only runs when no binding
   produced a listener. A `KeyBinding` built with a `None` context is global.
   Dispatch stops at the deepest listener unless it calls `cx.propagate()`.
+- **`key_context` lives on `InteractiveElement`.** `.key_context("CsvGrid")` next
+  to `.track_focus(..)` is what makes a context-scoped `KeyBinding` match. A
+  binding that finds a listener suppresses `on_key_down` for that keystroke, so a
+  shortcut the grid wants for itself (Cmd+C, Cmd+S) must not be bound anywhere.
+- **Clipboard reads and writes are on `App`.** `cx.write_to_clipboard(
+  ClipboardItem::new_string(text))` and `cx.read_from_clipboard()`, which returns
+  `Option<ClipboardItem>` (call `.text()` for the string). There is no
+  `ClipboardItem::new`, and `new_string` takes an owned `String`. In tests the
+  same two methods are on `TestAppContext`, which `VisualTestContext`
+  dereferences to, so a copy can be asserted on directly.
+- **`ClickEvent` is an enum, not a struct.** It is either
+  `Mouse(MouseClickEvent { down, up })` or `Keyboard(..)`, so reach through
+  `event.position()` (or `event.down.position`) rather than `event.position`.
+  `on_mouse_down` and `on_mouse_up` hand over a `MouseDownEvent`/`MouseUpEvent`
+  with `position`, `modifiers`, and `click_count` directly, which is simpler when
+  only the position is wanted.
+- **Only `on_click` and `on_drag` need an id.** They are registered on
+  `StatefulInteractiveElement` and do nothing without element state.
+  `on_mouse_down`, `on_mouse_up`, and `on_mouse_move` are on
+  `InteractiveElement` and work on a plain `Div`, so a row that has to react to a
+  click can carry one listener and derive the column from the pointer's x instead
+  of giving every cell a hitbox.
+- **`on_mouse_move` only fires while the pointer is over the element.**
+  `MouseMoveEvent::dragging()` reports whether the left button is down, but moves
+  stop arriving the moment the pointer leaves, so anything that tracks a drag
+  past an edge needs `on_drag` plus `on_drag_move` (capture phase, no hover
+  check, and a 2 px threshold before the drag starts).
+- **`simulate_click` hardcodes a click count of one.** A double click has to be
+  dispatched as a `MouseDownEvent`/`MouseUpEvent` pair with `click_count: 2`
+  through `simulate_event`.
+- **`ScrollDelta::Pixels` reports `precise() == true`.** A test wheel event built
+  from pixels therefore looks like a trackpad gesture, and the grid latches the
+  axis on the first one and keeps it, because a zero-delta `Ended` event returns
+  before the latch is cleared. Give each test gesture a `TouchPhase::Started` to
+  start a new one.
 - **`prompt_for_paths` is `unimplemented!()` in the test platform.** Any test that
   reaches the open dialog panics, so keep the dialog in its own handler and test
   the code that handler calls.
@@ -182,16 +218,30 @@ There is no rendered-text reader. Assert on view state (`cell_at`,
 
 ## Multi-document structure
 
-`Workspace` is the window's root view. It owns a `Vec<Entity<CsvGrid>>`, one per
-open document, plus the index of the visible one. Each tab is a live entity, so
-its sort and search survive switching away and back.
+`Workspace` is the window's root view. It owns a `Vec<TabView>`, one per open
+document, plus the index of the visible one. `TabView` is an enum over
+`Entity<CsvGrid>` and `Entity<JsonView>`, so a new format adds a variant and one
+arm per accessor (`path`, `focus_handle`, `focus`, `is_dirty`) instead of a
+second parallel list of tabs. `Workspace::open` is the only place that has to
+know how a core `Document` becomes a view. Each tab is a live entity, so its
+sort, search, or scroll position survives switching away and back.
 
 Rules that keep this working:
 
-- **Exactly one element holds the keyboard at a time: the active grid.**
+- **Exactly one element holds the keyboard at a time: the active tab's view.**
   `Workspace::focus_active` is called after anything that changes the visible
   tab. It falls back to the workspace's own handle when no tab is open, because
   without a focused element the window-level shortcuts never fire.
+- **The workspace observes every tab it creates.** A child's `cx.notify()` does
+  not redraw its parent, so a tab title that shows a dirty dot would otherwise
+  stay stale until the next unrelated render. `Workspace::track` observes each
+  view and notifies the workspace, which is also a convenient place to withdraw a
+  half-given close request.
+- **Closing a dirty tab asks twice.** The first request records
+  `pending_close` and explains itself in the error strip; a second request for
+  the same tab drops the edits. There is no undo, so a single keystroke must not
+  be able to throw work away, and a modal dialog is a bigger feature than the
+  guard is worth.
 - **Opening a path that is already open focuses its tab** rather than adding a
   second one. Paths are canonicalized first, so a relative command-line path and
   an absolute dialog path are recognised as the same file.
@@ -214,6 +264,10 @@ Rules that keep this working:
   entity and is changed in event handlers, which then call `cx.notify()`.
 - Sorting and searching never move data. `RowView` holds row *indices*, so an
   edit always targets a stable table index. Keep it that way.
+- JSON is shown as lines, not a tree, and formatting never reorders keys:
+  `serde_json` is built with `preserve_order` on purpose. Minifying refuses a
+  document over 400 KB because one shaped line of millions of characters stalls
+  the window; the formatted view still shows every byte.
 - Our own crates are built with `opt-level = 1` in dev and all dependencies at
   `opt-level = 3`, so a GUI frame is usable without a release build. That setting
   is also why cold builds are slow; do not lower it to speed up the first build
