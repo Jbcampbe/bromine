@@ -1,47 +1,22 @@
-//! Bromine: open a file and look at it.
+//! Bromine: open files and look at them.
 //!
 //! This binary only wires things together. Loading and parsing live in
 //! `bromine-core`, drawing lives in `bromine-ui`, and both can be tested without
 //! starting a window.
+//!
+//! Every path on the command line becomes a tab. With no arguments the window
+//! opens empty, and files are opened from inside it with Cmd+O.
 
 use std::path::PathBuf;
 
-use bromine_core::{Format, load_csv};
-use bromine_ui::CsvGrid;
+use bromine_ui::{CloseTab, OpenFile, Workspace};
 use gpui::{
-    Application, Bounds, SharedString, TitlebarOptions, WindowBounds, WindowOptions, prelude::*,
-    px, size,
+    Application, Bounds, KeyBinding, SharedString, TitlebarOptions, WindowBounds, WindowOptions,
+    prelude::*, px, size,
 };
 
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("bromine: {error}");
-        std::process::exit(1);
-    }
-}
-
-fn run() -> anyhow::Result<()> {
-    let path = match std::env::args_os().nth(1) {
-        Some(path) => PathBuf::from(path),
-        None => anyhow::bail!("usage: bromine <file.csv>"),
-    };
-
-    let document = match Format::from_path(&path) {
-        Some(Format::Csv) => load_csv(&path)?,
-        Some(Format::Json) => {
-            anyhow::bail!("{} is JSON, which Bromine cannot show yet", path.display())
-        }
-        Some(Format::Markdown) => anyhow::bail!(
-            "{} is Markdown, which Bromine cannot show yet",
-            path.display()
-        ),
-        None => anyhow::bail!("{} is not a format Bromine recognises", path.display()),
-    };
-
-    let name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string());
+    let paths: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
 
     Application::new().run(move |cx| {
         let options = WindowOptions {
@@ -51,21 +26,31 @@ fn run() -> anyhow::Result<()> {
                 cx,
             ))),
             titlebar: Some(TitlebarOptions {
-                title: Some(SharedString::from(format!("{name} - Bromine"))),
+                title: Some(SharedString::from("Bromine")),
                 ..Default::default()
             }),
             window_min_size: Some(size(px(480.0), px(320.0))),
             ..Default::default()
         };
 
-        let grid = cx.new(|cx| CsvGrid::new(path, document, cx));
+        // Global, unbound-by-context shortcuts, so they work no matter which
+        // tab has focus.
+        cx.bind_keys([
+            KeyBinding::new("cmd-o", OpenFile, None),
+            KeyBinding::new("cmd-w", CloseTab, None),
+        ]);
 
-        let window = match cx.open_window(options, |window, cx| {
-            // Focus before the first frame, so the grid is already the target of
-            // key events when the window appears.
-            grid.read(cx).focus(window);
-            grid.clone()
-        }) {
+        let workspace = cx.new(Workspace::new);
+
+        // A file that cannot be opened is reported in the window rather than
+        // ending the process, so one bad argument does not hide the others.
+        workspace.update(cx, |workspace, cx| {
+            for path in paths {
+                workspace.open(path, cx);
+            }
+        });
+
+        let window = match cx.open_window(options, |_window, _cx| workspace.clone()) {
             Ok(window) => window,
             Err(error) => {
                 eprintln!("bromine: could not open a window: {error}");
@@ -73,14 +58,14 @@ fn run() -> anyhow::Result<()> {
             }
         };
 
-        // Creating the window can move focus, so focus once more now that it
-        // exists.
-        if let Err(error) = window.update(cx, |grid, window, _cx| grid.focus(window)) {
-            eprintln!("bromine: could not focus the grid: {error}");
+        // Focus once the window exists: the grid's element has to have been laid
+        // out before it can hold the keyboard.
+        if let Err(error) = window.update(cx, |workspace, window, cx| {
+            workspace.focus_active(window, cx);
+        }) {
+            eprintln!("bromine: could not focus the window: {error}");
         }
 
         cx.activate(true);
     });
-
-    Ok(())
 }

@@ -6,5 +6,7 @@
 pub mod theme;
 
 mod csv_grid;
+mod workspace;
 
 pub use csv_grid::{CsvGrid, ROW_HEIGHT};
+pub use workspace::{CloseTab, OpenFile, Workspace};

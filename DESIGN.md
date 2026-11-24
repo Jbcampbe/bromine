@@ -46,10 +46,17 @@ labels, and one larger size for a file name or heading. Resist adding a fourth.
 
 ## Layout
 
-- A header strip carrying the file name, the row/column counts, and any repair
-  warning.
+- A tab strip: one tab per open file, named after the file, with its close
+  affordance on the tab itself and an "open" action at the far right. The visible
+  tab is distinguished by background, not by an underline or a heavier border.
+  Tabs shrink and truncate rather than scrolling; a tab bar that scrolls is a
+  later problem.
+- A header strip carrying the row and column counts and any repair warning. The
+  file name lives in the tab, so it is not repeated here.
 - A search bar, kept minimal: one field and a match count.
 - The grid, which takes all remaining space and is the only scrolling region.
+- An error strip, under the tab strip, only when opening a file failed. It is
+  dismissable and never covers the grid.
 - Column widths are uniform and fixed for now. Per-column sizing is a later
   problem; solving it early would fight `uniform_list`.
 

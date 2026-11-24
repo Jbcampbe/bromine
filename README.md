@@ -12,21 +12,26 @@ recognised but not implemented.
 **Works today**
 
 - Opens a CSV or TSV file, detecting the delimiter.
-- Shows it in a virtualized grid that stays responsive on large files.
+- Keeps several files open at once as browser-style tabs. Cmd+O opens files from
+  a native panel, Cmd+W closes the visible tab, and reopening a path you already
+  have focuses the tab that holds it instead of duplicating it.
+- Shows each file in a virtualized grid that stays responsive on large files.
 - Sorts by any column on click. Numeric columns sort as numbers, so `9` comes
   before `10`, and clicking the same header again reverses the order.
-- Filters as you type (backspace deletes, escape clears).
+- Filters as you type (backspace deletes, escape clears). Each tab keeps its own
+  sort and search.
 - Reports row and column counts, and says so when the parser had to repair
   ragged input or decode a file that was not valid UTF-8.
 
 **Does not work yet**
 
 - Cell editing and saving. The grid is read-only and labels itself that way.
-- JSON and Markdown. Passing one of those files exits with a clear message.
+- JSON and Markdown. Opening one of those files reports why in the window.
 - Per-column widths and horizontal scrolling. Columns share the width equally,
   and long values are truncated with an ellipsis.
 - A real search field with a caret. Search is driven by raw keystrokes, which
   means it has no cursor, no selection, and no undo.
+- Reordering tabs, and closing the window when the last tab closes.
 
 ## Requirements
 
@@ -39,7 +44,8 @@ recognised but not implemented.
 ## Build and run
 
 ```bash
-cargo run -p bromine -- fixtures/people.csv
+cargo run -p bromine -- fixtures/people.csv fixtures/quirky.csv   # two tabs
+cargo run -p bromine                                              # empty window
 ```
 
 The first build takes several minutes (measured: about 6 minutes and 3 GB of
@@ -50,13 +56,14 @@ paying that cost.
 ## Tests
 
 ```bash
-cargo test --workspace        # 46 tests: 34 core, 8 fixture contracts, 4 views
+cargo test --workspace        # 59 tests: 38 core, 8 fixture contracts, 13 views
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 `bromine-core` has no GPUI dependency, so parsing, sorting, searching, and
-writing are tested headlessly. The four view tests drive real frames with GPUI's
-test harness: they type into the window and click column headers.
+writing are tested headlessly. The thirteen view tests drive real frames with
+GPUI's test harness: they type into the window, click column headers, click
+tabs, and send Cmd+W through the real keymap.
 
 ## Layout
 
@@ -77,3 +84,8 @@ The test suite and a launch check are run on every change: the app is started on
 a fixture and confirmed to register as a foreground macOS application. What
 cannot be checked on this machine is the pixels, because `screencapture` is
 blocked for the terminal. If you change the layout, look at the window yourself.
+
+One code path has no automated cover at all: the native open panel. GPUI's test
+platform stubs `prompt_for_paths` with `unimplemented!()`, so Cmd+O is only ever
+exercised by hand. Everything downstream of it (the paths arriving, the file
+loading, the tab appearing) is tested through `Workspace::open` directly.

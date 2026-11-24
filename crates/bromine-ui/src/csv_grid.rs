@@ -178,13 +178,10 @@ impl CsvGrid {
         (!parts.is_empty()).then(|| parts.join(", "))
     }
 
+    /// The counts and repair notice for the open file.
+    ///
+    /// The file name is not repeated here: the tab above the grid carries it.
     fn title_bar(&self) -> Div {
-        let name = self
-            .path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| self.path.display().to_string());
-
         let total = self.total_row_count();
         let columns = self.column_count();
         let counts = if self.view.len() == total {
@@ -202,7 +199,6 @@ impl CsvGrid {
             .py_2()
             .border_b_1()
             .border_color(theme::border())
-            .child(div().text_base().child(SharedString::from(name)))
             .child(
                 div()
                     .text_xs()

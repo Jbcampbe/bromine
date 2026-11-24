@@ -105,8 +105,24 @@ them after an upgrade.
   `EntityInputHandler` plus `window.handle_input(...)` during paint. Until that
   exists, the search box is driven by raw `KeyDownEvent.keystroke.key_char`.
 - **Keyboard events follow focus.** Nothing in `on_key_down` fires unless the
-  element carrying `.track_focus(&handle)` has been focused. The binary focuses
-  the grid both before the first frame and again after the window opens.
+  element carrying `.track_focus(&handle)` has been focused. The *child* has to
+  call `track_focus`; a parent cannot do it on the child's behalf. Focusing a
+  handle whose element has not been painted yet falls back to the root node for
+  one frame.
+- **Actions run before key listeners.** `dispatch_key_event` matches bindings
+  first and dispatches the action; `on_key_down` only runs when no binding
+  produced a listener. A `KeyBinding` built with a `None` context is global.
+  Dispatch stops at the deepest listener unless it calls `cx.propagate()`.
+- **`prompt_for_paths` is `unimplemented!()` in the test platform.** Any test that
+  reaches the open dialog panics, so keep the dialog in its own handler and test
+  the code that handler calls.
+- **`PathPromptOptions` has no `Default` and no builder methods**, and cannot
+  filter by file type. The panel lets the user pick anything, so the loader has
+  to reject what it cannot show.
+- **`WeakEntity::update_in`** is how to get `(&mut View, &mut Window)` back after
+  an async step such as the open dialog resolving.
+- **`SharedString::as_deref()` yields `&ArcCow<str>`, not `&str`.** Convert with
+  `.map(|value| &**value)`.
 
 ## Testing views
 
@@ -127,6 +143,32 @@ Two more details worth knowing:
 
 There is no rendered-text reader. Assert on view state (`cell_at`,
 `visible_row_count`) or on `debug_bounds`, never on what "looks right".
+
+## Multi-document structure
+
+`Workspace` is the window's root view. It owns a `Vec<Entity<CsvGrid>>`, one per
+open document, plus the index of the visible one. Each tab is a live entity, so
+its sort and search survive switching away and back.
+
+Rules that keep this working:
+
+- **Exactly one element holds the keyboard at a time: the active grid.**
+  `Workspace::focus_active` is called after anything that changes the visible
+  tab. It falls back to the workspace's own handle when no tab is open, because
+  without a focused element the window-level shortcuts never fire.
+- **Opening a path that is already open focuses its tab** rather than adding a
+  second one. Paths are canonicalized first, so a relative command-line path and
+  an absolute dialog path are recognised as the same file.
+- **A failed open is reported in the error strip and changes nothing else.** It
+  never ends the process, so one bad command-line argument cannot hide the rest.
+- **Shortcuts are actions, not key matching.** `OpenFile` and `CloseTab` are
+  declared in `bromine-ui/src/workspace.rs`, bound with a `None` context in the
+  binary, and handled by `.on_action` on the workspace root. Do not move them
+  into `CsvGrid::on_key_down`: once a binding exists, that listener never sees
+  the keystroke.
+- **The open panel is shared and cannot be reconfigured while it is up.** A
+  `prompting` flag stops a second Cmd+O from mutating the panel already on
+  screen.
 
 ## Conventions
 

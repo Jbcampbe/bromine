@@ -43,3 +43,84 @@ impl Format {
         }
     }
 }
+
+impl std::fmt::Display for Format {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Csv => "CSV",
+            Self::Json => "JSON",
+            Self::Markdown => "Markdown",
+        })
+    }
+}
+
+/// Load whatever `path` holds, or explain why it cannot be shown.
+///
+/// This is the only place that decides which format engine to use. Keeping the
+/// decision here means the command line and the window cannot disagree about
+/// what is supported, and that a new format is added in one place.
+pub fn load_document(path: &std::path::Path) -> Result<CsvDocument, CoreError> {
+    match Format::from_path(path) {
+        Some(Format::Csv) => load_csv(path),
+        Some(format) => Err(CoreError::NotImplemented {
+            path: path.to_path_buf(),
+            format,
+        }),
+        None => Err(CoreError::UnsupportedFormat {
+            path: path.to_path_buf(),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    fn fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures")
+            .join(name)
+    }
+
+    #[test]
+    fn a_csv_path_loads_through_the_dispatch() {
+        let document = load_document(&fixture("people.csv")).expect("people.csv loads");
+
+        assert_eq!(document.table.header(0), Some("name"));
+        assert_eq!(document.table.row_count(), 6);
+    }
+
+    #[test]
+    fn a_known_format_without_a_viewer_says_not_yet_rather_than_never() {
+        let error = load_document(Path::new("package.json")).unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("JSON"), "unexpected message: {message}");
+        assert!(
+            message.contains("cannot show yet"),
+            "unexpected message: {message}"
+        );
+        assert!(matches!(error, CoreError::NotImplemented { .. }));
+    }
+
+    #[test]
+    fn an_unknown_extension_is_reported_as_unopenable() {
+        let error = load_document(Path::new("notes.txt")).unwrap_err();
+
+        assert!(matches!(error, CoreError::UnsupportedFormat { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("is not a format Bromine can open")
+        );
+    }
+
+    #[test]
+    fn a_missing_file_still_reports_the_path() {
+        let error = load_document(Path::new("fixtures/absent.csv")).unwrap_err();
+
+        assert!(matches!(error, CoreError::Read { .. }));
+        assert!(error.to_string().contains("fixtures/absent.csv"));
+    }
+}
