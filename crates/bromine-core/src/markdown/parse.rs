@@ -57,8 +57,11 @@ struct Builder<'a> {
     bold: usize,
     italic: usize,
     strikethrough: usize,
+    code: usize,
     link: Option<String>,
     html_block: bool,
+    html_block_index: Option<usize>,
+    hidden_html: usize,
 }
 
 /// Parse a text document into rows, blocks, and tables.
@@ -89,14 +92,18 @@ pub(super) fn parse(document: &TextDocument) -> (Vec<Row>, Vec<Block>, Vec<Table
         bold: 0,
         italic: 0,
         strikethrough: 0,
+        code: 0,
         link: None,
         html_block: false,
+        html_block_index: None,
+        hidden_html: 0,
     };
 
     let mut options = Options::empty();
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_TASKLISTS);
     options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_FOOTNOTES);
     options.insert(Options::ENABLE_GFM);
 
     for (event, range) in Parser::new_ext(source, options).into_offset_iter() {
@@ -120,22 +127,8 @@ impl<'a> Builder<'a> {
                     ..RunStyle::default()
                 },
             ),
-            Event::Html(text) => self.visible(
-                &text,
-                range,
-                RunStyle {
-                    raw: true,
-                    ..RunStyle::default()
-                },
-            ),
-            Event::InlineHtml(text) => self.visible(
-                &text,
-                range,
-                RunStyle {
-                    raw: true,
-                    ..RunStyle::default()
-                },
-            ),
+            Event::Html(text) => self.html(&text, range),
+            Event::InlineHtml(text) => self.html(&text, range),
             Event::SoftBreak | Event::HardBreak => {}
             Event::Rule => {
                 self.push_block(range.clone(), BlockKind::Rule);
@@ -186,7 +179,8 @@ impl<'a> Builder<'a> {
             }
             Tag::HtmlBlock => {
                 self.html_block = true;
-                self.push_block(range, BlockKind::Html);
+                let index = self.push_block(range, BlockKind::Html);
+                self.html_block_index = Some(index);
             }
             Tag::List(start) => {
                 self.list_stack.push(ListContext {
@@ -233,6 +227,9 @@ impl<'a> Builder<'a> {
                     alt: String::new(),
                     location: resolve_image(self.base_dir, &destination),
                     destination,
+                    width: None,
+                    height: None,
+                    caption: true,
                 };
                 self.image_spans.push((range, info));
                 self.image_stack.push(self.image_spans.len() - 1);
@@ -281,7 +278,10 @@ impl<'a> Builder<'a> {
                 self.quote_depth = self.quote_depth.saturating_sub(1);
             }
             TagEnd::CodeBlock => {}
-            TagEnd::HtmlBlock => self.html_block = false,
+            TagEnd::HtmlBlock => {
+                self.html_block = false;
+                self.html_block_index = None;
+            }
             TagEnd::List(_) => {
                 self.list_stack.pop();
             }
@@ -328,6 +328,218 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Walk an HTML event: hide the tags, keep the text between them.
+    ///
+    /// GitHub accepts a slice of HTML and sanitizes it for the page. Bromine is
+    /// not a browser, so it does the same job for a document: tags become gaps
+    /// in the source map, their contents become ordinary styled runs, and the
+    /// few tags that change layout (`p`, `div`, `h1`-`h6`, `hr`, `img`, `br`)
+    /// are applied to the row or block. The tags themselves are never executed.
+    fn html(&mut self, text: &str, range: Range<usize>) {
+        let mut cursor = 0;
+        while cursor < text.len() {
+            let rest = &text[cursor..];
+            let Some(open) = rest.find('<') else {
+                self.html_text(rest, range.start + cursor);
+                break;
+            };
+
+            if open > 0 {
+                self.html_text(&rest[..open], range.start + cursor);
+            }
+            let tag_start = cursor + open;
+            let after = &text[tag_start..];
+
+            if after.starts_with("<!--") {
+                match after.find("-->") {
+                    Some(end) => {
+                        cursor = tag_start + end + 3;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+
+            let Some(close) = tag_end(after) else {
+                // Not a well-formed tag; showing the remainder as text is more
+                // honest than silently dropping it.
+                self.html_text(after, range.start + tag_start);
+                break;
+            };
+
+            let raw = &after[..=close];
+            self.html_tag(
+                raw,
+                range.start + tag_start..range.start + tag_start + close + 1,
+            );
+            cursor = tag_start + close + 1;
+        }
+    }
+
+    fn html_text(&mut self, text: &str, start: usize) {
+        if self.hidden_html > 0 {
+            return;
+        }
+        if text.trim().is_empty() {
+            // Whitespace around block tags is layout. A space between inline
+            // tags is content, so keep one, but indentation at the start of a
+            // line is not.
+            let line = self.document.line_of(start);
+            let line_start = self.document.line_start(line).unwrap_or(0);
+            let has_text_before = self
+                .source
+                .get(line_start..start)
+                .is_some_and(|before| !before.trim().is_empty());
+            if !text.contains('\n') && !text.is_empty() && has_text_before {
+                self.visible(" ", start..start + 1, RunStyle::default());
+            }
+            return;
+        }
+
+        // Indentation and the trailing newline in a line of HTML are layout;
+        // spaces inside an inline run are content.
+        let content = if text.contains('\n') {
+            text.trim_matches(|character: char| character.is_whitespace())
+        } else {
+            text
+        };
+        if content.is_empty() {
+            return;
+        }
+        let leading = text.find(content).unwrap_or(0);
+        self.visible(
+            content,
+            start + leading..start + leading + content.len(),
+            RunStyle::default(),
+        );
+    }
+
+    fn html_tag(&mut self, raw: &str, source: Range<usize>) {
+        let inner = raw.trim_start_matches('<').trim_end_matches('>').trim();
+        if inner.starts_with('!') || inner.starts_with('?') {
+            return;
+        }
+
+        let closing = inner.starts_with('/');
+        let inner = inner.trim_start_matches('/');
+        let name_end = inner
+            .find(|character: char| character.is_whitespace() || character == '/')
+            .unwrap_or(inner.len());
+        let name = inner[..name_end].to_ascii_lowercase();
+        if name.is_empty() {
+            return;
+        }
+
+        // GitHub sanitizes these elements out of the page entirely. Showing
+        // their contents would be worse than dropping them: a script is not
+        // prose and a style block is not a document.
+        let hidden_element = matches!(
+            name.as_str(),
+            "script" | "style" | "template" | "iframe" | "object" | "embed"
+        );
+        let self_closing = !closing && is_self_closing(raw);
+        if self.hidden_html > 0 {
+            if hidden_element {
+                if closing {
+                    self.hidden_html = self.hidden_html.saturating_sub(1);
+                } else if !self_closing {
+                    self.hidden_html += 1;
+                }
+            }
+            return;
+        }
+        if hidden_element {
+            if !closing && !self_closing {
+                self.hidden_html += 1;
+            }
+            return;
+        }
+
+        if closing {
+            match name.as_str() {
+                "em" | "i" => self.italic = self.italic.saturating_sub(1),
+                "strong" | "b" => self.bold = self.bold.saturating_sub(1),
+                "code" => self.code = self.code.saturating_sub(1),
+                "s" | "del" | "strike" => self.strikethrough = self.strikethrough.saturating_sub(1),
+                "a" => self.link = None,
+                "blockquote" => self.quote_depth = self.quote_depth.saturating_sub(1),
+                _ => {}
+            }
+            return;
+        }
+
+        let attributes = parse_attributes(&inner[name_end..]);
+        let attribute = |wanted: &str| {
+            attributes
+                .iter()
+                .find(|(name, _)| name == wanted)
+                .map(|(_, value)| value.clone())
+        };
+
+        match name.as_str() {
+            "p" | "div" => self.set_html_block(BlockKind::Paragraph, attribute("align").as_deref()),
+            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                let level = name[1..].parse::<u8>().unwrap_or(1);
+                self.set_html_block(BlockKind::Heading(level), attribute("align").as_deref());
+            }
+            "hr" => self.set_html_block(BlockKind::Rule, None),
+            "img" => {
+                let Some(destination) = attribute("src") else {
+                    return;
+                };
+                let alt = attribute("alt").unwrap_or_default();
+                let info = ImageInfo {
+                    alt,
+                    location: resolve_image(self.base_dir, &destination),
+                    destination,
+                    width: attribute("width").and_then(|value| parse_pixels(&value)),
+                    height: attribute("height").and_then(|value| parse_pixels(&value)),
+                    caption: false,
+                };
+                self.image_spans.push((source, info));
+            }
+            "br" => {
+                // A row is one source line, so a `<br>` cannot split it. A
+                // space keeps the words on either side from running together,
+                // and pointing the run at the tag lets active mode reveal it.
+                let line = self.document.line_of(source.start);
+                let needs_space = self
+                    .runs
+                    .get(line)
+                    .and_then(|runs| runs.last())
+                    .is_some_and(|run| {
+                        run.text
+                            .chars()
+                            .last()
+                            .is_some_and(|character| !character.is_whitespace())
+                    });
+                if needs_space {
+                    self.visible(" ", source.clone(), RunStyle::default());
+                }
+            }
+            "em" | "i" => self.italic += 1,
+            "strong" | "b" => self.bold += 1,
+            "code" => self.code += 1,
+            "s" | "del" | "strike" => self.strikethrough += 1,
+            "a" => self.link = attribute("href"),
+            "blockquote" => self.quote_depth += 1,
+            _ => {}
+        }
+    }
+
+    fn set_html_block(&mut self, kind: BlockKind, align: Option<&str>) {
+        let Some(index) = self.html_block_index else {
+            return;
+        };
+        let Some(block) = self.blocks.get_mut(index) else {
+            return;
+        };
+        block.kind = kind;
+        if let Some(alignment) = align.and_then(parse_alignment) {
+            block.alignment = alignment;
+        }
+    }
+
     /// Add a visible event, splitting it across the source lines it covers.
     ///
     /// A code block's text event holds several lines at once, so this is not
@@ -344,11 +556,9 @@ impl<'a> Builder<'a> {
 
         style.bold |= self.bold > 0;
         style.italic |= self.italic > 0;
+        style.code |= self.code > 0;
         style.strikethrough |= self.strikethrough > 0;
         style.link = self.link.clone();
-        if self.html_block {
-            style.raw = true;
-        }
 
         // Inline code's event range includes its backticks while its text does
         // not. Using the range unchanged would make the source map point at a
@@ -382,6 +592,7 @@ impl<'a> Builder<'a> {
             source,
             rows: 0..0,
             table: None,
+            alignment: Alignment::None,
         });
         id.0
     }
@@ -400,6 +611,7 @@ impl<'a> Builder<'a> {
                 list: None,
                 task: None,
                 image: None,
+                alignment: Alignment::None,
             })
             .collect();
 
@@ -439,7 +651,11 @@ impl<'a> Builder<'a> {
             let mut chosen: Option<usize> = None;
             for (index, block) in self.blocks.iter().enumerate() {
                 let overlaps = if line_start == line_end {
-                    block.source.start <= line_start && line_start <= block.source.end
+                    // A blank line belongs to a block only when it sits
+                    // strictly inside it, such as the empty line in a fenced
+                    // block. A blank line at a block's edge is the gap between
+                    // blocks and must stay blank.
+                    block.source.start < line_start && line_start < block.source.end
                 } else {
                     block.source.start < line_end && block.source.end > line_start
                 };
@@ -456,6 +672,7 @@ impl<'a> Builder<'a> {
                     source: row.source.clone(),
                     rows: line..line + 1,
                     table: None,
+                    alignment: Alignment::None,
                 });
                 row.block = id;
                 row.kind = RowKind::Blank;
@@ -506,6 +723,24 @@ impl<'a> Builder<'a> {
                 .map(|(_, depth)| *depth)
                 .max()
                 .unwrap_or(0);
+
+            // A line that held nothing but HTML tags has no visible content.
+            // Marking it as HTML lets the view collapse it while the block is
+            // inactive and reveal the tag when the block is being edited.
+            // Code, fences, rules, and tables keep their own kinds: a `<hr>`
+            // is a rule, not a tag line, and a code line that happens to start
+            // with `<` is still code.
+            if matches!(
+                row.kind,
+                RowKind::Paragraph | RowKind::Heading(_) | RowKind::ListItem
+            ) && row.image.is_none()
+                && row.text.trim().is_empty()
+                && self.source[row.source.clone()]
+                    .trim_start()
+                    .starts_with('<')
+            {
+                row.kind = RowKind::Html;
+            }
         }
 
         for block in &mut self.blocks {
@@ -540,6 +775,8 @@ fn apply_kind(
     let last = document
         .line_of(block.source.end.saturating_sub(1))
         .max(first);
+
+    row.alignment = block.alignment;
 
     match &block.kind {
         BlockKind::Paragraph => row.kind = RowKind::Paragraph,
@@ -654,6 +891,182 @@ fn heading_level(level: HeadingLevel) -> u8 {
         HeadingLevel::H5 => 5,
         HeadingLevel::H6 => 6,
     }
+}
+
+/// The index of the `>` that closes a tag, ignoring ones inside quotes.
+///
+/// An attribute value such as `alt="a > b"` is legal HTML, so a plain search
+/// for the first `>` would cut the tag in half and leave the rest as text.
+fn tag_end(tag: &str) -> Option<usize> {
+    let mut quote = None;
+    for (index, character) in tag.char_indices() {
+        match quote {
+            Some(open) => {
+                if character == open {
+                    quote = None;
+                }
+            }
+            None => match character {
+                '"' | '\'' => quote = Some(character),
+                '>' => return Some(index),
+                _ => {}
+            },
+        }
+    }
+    None
+}
+
+/// Whether the tag ends in `/` outside its quoted attributes.
+fn is_self_closing(tag: &str) -> bool {
+    let mut quote = None;
+    let mut last = None;
+    for character in tag.chars() {
+        match quote {
+            Some(open) => {
+                if character == open {
+                    quote = None;
+                }
+            }
+            None => match character {
+                '"' | '\'' => quote = Some(character),
+                '>' => break,
+                _ if !character.is_whitespace() => last = Some(character),
+                _ => {}
+            },
+        }
+    }
+    last == Some('/')
+}
+
+fn parse_attributes(input: &str) -> Vec<(String, String)> {
+    let bytes = input.as_bytes();
+    let mut attributes = Vec::new();
+    let mut index = 0;
+
+    while index < bytes.len() {
+        while index < bytes.len() && (bytes[index].is_ascii_whitespace() || bytes[index] == b'/') {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            break;
+        }
+
+        let name_start = index;
+        while index < bytes.len()
+            && !bytes[index].is_ascii_whitespace()
+            && bytes[index] != b'='
+            && bytes[index] != b'/'
+        {
+            index += 1;
+        }
+        if index == name_start {
+            index += 1;
+            continue;
+        }
+        let name = input[name_start..index].to_ascii_lowercase();
+
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+
+        let mut value = String::new();
+        if index < bytes.len() && bytes[index] == b'=' {
+            index += 1;
+            while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+                index += 1;
+            }
+            if index < bytes.len() && (bytes[index] == b'"' || bytes[index] == b'\'') {
+                let quote = bytes[index];
+                index += 1;
+                let start = index;
+                while index < bytes.len() && bytes[index] != quote {
+                    index += 1;
+                }
+                value = decode_entities(&input[start..index]);
+                if index < bytes.len() {
+                    index += 1;
+                }
+            } else {
+                let start = index;
+                while index < bytes.len()
+                    && !bytes[index].is_ascii_whitespace()
+                    && bytes[index] != b'/'
+                {
+                    index += 1;
+                }
+                value = decode_entities(&input[start..index]);
+            }
+        }
+
+        attributes.push((name, value));
+    }
+
+    attributes
+}
+
+fn decode_entities(value: &str) -> String {
+    let mut decoded = String::with_capacity(value.len());
+    let mut rest = value;
+
+    while let Some(position) = rest.find('&') {
+        decoded.push_str(&rest[..position]);
+        let after = &rest[position + 1..];
+        if let Some(end) = after.find(';').filter(|end| *end <= 10)
+            && let Some(character) = decode_entity(&after[..end])
+        {
+            decoded.push(character);
+            rest = &after[end + 1..];
+            continue;
+        }
+        decoded.push('&');
+        rest = after;
+    }
+
+    decoded.push_str(rest);
+    decoded
+}
+
+fn decode_entity(entity: &str) -> Option<char> {
+    match entity {
+        "amp" => Some('&'),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        "nbsp" => Some(' '),
+        _ => {
+            let digits = entity.strip_prefix('#')?;
+            let hex = digits
+                .strip_prefix('x')
+                .or_else(|| digits.strip_prefix('X'));
+            let number = if let Some(hex) = hex {
+                u32::from_str_radix(hex, 16).ok()?
+            } else {
+                digits.parse::<u32>().ok()?
+            };
+            char::from_u32(number)
+        }
+    }
+}
+
+fn parse_alignment(value: &str) -> Option<Alignment> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "left" => Some(Alignment::Left),
+        "center" | "middle" => Some(Alignment::Center),
+        "right" => Some(Alignment::Right),
+        _ => None,
+    }
+}
+
+/// Read a pixel dimension. Percentages and other units are ignored rather
+/// than guessed at, because a browser's box model is not this view's.
+fn parse_pixels(value: &str) -> Option<u32> {
+    let digits: String = value
+        .trim()
+        .chars()
+        .take_while(|character| character.is_ascii_digit())
+        .collect();
+    digits.parse::<u32>().ok().filter(|pixels| *pixels > 0)
 }
 
 /// Resolve a Markdown image destination to something the view can load.

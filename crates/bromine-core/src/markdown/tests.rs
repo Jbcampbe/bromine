@@ -342,3 +342,255 @@ fn the_notes_fixture_parses_every_kind_it_documents() {
         }
     }
 }
+
+#[test]
+fn an_html_block_hides_its_tags_and_keeps_its_text_and_styles() {
+    let document = parse("<h2 align=\"center\">A <em>small</em> <code>x</code> note</h2>\n");
+    let row = &document.rows()[0];
+
+    assert_eq!(row.kind, RowKind::Heading(2));
+    assert_eq!(row.alignment, Alignment::Center);
+    assert_eq!(row.text, "A small x note");
+    assert!(!row.text.contains('<'), "tags are not display text");
+
+    let italic = row
+        .runs
+        .iter()
+        .find(|run| run.text == "small")
+        .expect("the italic text is a run");
+    assert!(italic.style.italic);
+    let code = row
+        .runs
+        .iter()
+        .find(|run| run.text == "x")
+        .expect("the code text is a run");
+    assert!(code.style.code);
+}
+
+#[test]
+fn html_links_and_strikethrough_keep_their_styles() {
+    let document = parse("<p><a href=\"https://example.com\">link</a> <del>gone</del></p>\n");
+    let row = &document.rows()[0];
+
+    let link = row
+        .runs
+        .iter()
+        .find(|run| run.text == "link")
+        .expect("the link text is a run");
+    assert_eq!(link.style.link.as_deref(), Some("https://example.com"));
+    let struck = row
+        .runs
+        .iter()
+        .find(|run| run.text == "gone")
+        .expect("the struck text is a run");
+    assert!(struck.style.strikethrough);
+}
+
+#[test]
+fn an_html_attribute_value_may_contain_a_greater_than_sign() {
+    let document = parse("<p title=\"a > b\">Text</p>\n");
+    let row = &document.rows()[0];
+
+    assert_eq!(row.text, "Text");
+    assert!(!row.text.contains('>'), "the tag must end at its own `>`");
+}
+
+#[test]
+fn a_self_closing_hidden_element_does_not_swallow_the_document() {
+    let document = parse("<iframe src=\"x\" />\nVisible\n");
+    let text = document
+        .rows()
+        .iter()
+        .map(|row| row.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(text.contains("Visible"), "{text:?}");
+}
+
+#[test]
+fn an_html_break_keeps_the_words_on_either_side_apart() {
+    let document = parse("<p>A<br>B</p>\n");
+    let row = &document.rows()[0];
+
+    assert_eq!(row.text, "A B");
+    assert!(!row.text.contains('<'), "the break tag stays hidden");
+}
+
+#[test]
+fn an_html_image_becomes_an_image_row_with_its_dimensions() {
+    let document = parse(
+        "<p align=\"center\">\n  <img src=\"diagram.svg\" width=\"112\" alt=\"A diagram\">\n</p>\n",
+    );
+
+    assert_eq!(document.rows()[0].kind, RowKind::Html);
+    assert_eq!(document.rows()[0].alignment, Alignment::Center);
+    let row = &document.rows()[1];
+    assert_eq!(row.kind, RowKind::Image);
+    let image = row.image.as_ref().expect("the image tag is captured");
+    assert_eq!(image.alt, "A diagram");
+    assert_eq!(image.width, Some(112));
+    assert_eq!(image.height, None);
+    assert!(!image.caption, "HTML alt text is not a caption");
+    assert!(matches!(
+        &image.location,
+        ImageLocation::Local(path) if path.ends_with("fixtures/diagram.svg")
+    ));
+    assert_eq!(document.rows()[2].kind, RowKind::Html);
+}
+
+#[test]
+fn html_attribute_entities_are_decoded_before_an_image_is_fetched() {
+    let document =
+        parse("<img src=\"https://img.example/badge?logo=apple&amp;label=a%2Bb\" alt=\"Badge\">\n");
+    let image = document.rows()[0]
+        .image
+        .as_ref()
+        .expect("the remote image is captured");
+
+    assert_eq!(
+        image.destination,
+        "https://img.example/badge?logo=apple&label=a%2Bb"
+    );
+    assert_eq!(
+        image.location,
+        ImageLocation::Remote("https://img.example/badge?logo=apple&label=a%2Bb".into())
+    );
+}
+
+#[test]
+fn a_blank_line_after_a_rule_stays_blank() {
+    let document = parse("---\n\nAfter\n");
+
+    assert_eq!(document.rows()[0].kind, RowKind::Rule);
+    assert_eq!(document.rows()[1].kind, RowKind::Blank);
+    assert_eq!(document.rows()[2].kind, RowKind::Paragraph);
+}
+
+#[test]
+fn the_project_readme_has_no_visible_html_or_unresolved_images() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../README.md");
+    let document = MarkdownDocument::load(&path).expect("the README loads");
+
+    // Code spans are the one place a tag is allowed to stay visible: the README
+    // writes `<img>` and `<version>` inside backticks on purpose. Anything
+    // outside code is a tag that escaped into the prose.
+    let leaked = document
+        .rows()
+        .iter()
+        .flat_map(|row| row.runs.iter())
+        .filter(|run| !run.style.code)
+        .filter(|run| contains_html_tag(&run.text))
+        .map(|run| run.text.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        leaked.is_empty(),
+        "raw HTML tags must not reach the display text: {leaked:?}"
+    );
+    assert!(
+        document
+            .rows()
+            .iter()
+            .any(|row| row.alignment == Alignment::Center),
+        "the README header uses centered HTML"
+    );
+
+    let image = document
+        .rows()
+        .iter()
+        .find_map(|row| row.image.as_ref())
+        .expect("the README draws images");
+    assert!(
+        matches!(&image.location, ImageLocation::Local(path) if path.ends_with("assets/icon.svg")),
+        "the logo resolves beside the README: {:?}",
+        image.location
+    );
+    assert!(
+        matches!(&image.location, ImageLocation::Local(path) if path.exists()),
+        "the resolved logo exists on disk: {:?}",
+        image.location
+    );
+}
+
+#[test]
+fn the_html_fixture_keeps_its_content_and_drops_its_scripts() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/html.md");
+    let document = MarkdownDocument::load(&path).expect("the HTML fixture loads");
+
+    let text = document
+        .rows()
+        .iter()
+        .map(|row| row.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("HTML and GFM"), "{text:?}");
+    assert!(text.contains("Hidden tags, visible text"), "{text:?}");
+    assert!(
+        text.contains("The summary and the body text are shown"),
+        "{text:?}"
+    );
+    assert!(
+        !text.contains("This script text is hidden"),
+        "a script's body is not prose: {text:?}"
+    );
+    assert!(
+        text.contains("GitHub alerts keep their text"),
+        "an alert keeps its text: {text:?}"
+    );
+    assert!(
+        text.contains("Footnotes are collected and shown as text"),
+        "a footnote definition stays readable: {text:?}"
+    );
+
+    let leaked = document
+        .rows()
+        .iter()
+        .flat_map(|row| row.runs.iter())
+        .filter(|run| !run.style.code)
+        .filter(|run| contains_html_tag(&run.text))
+        .map(|run| run.text.as_str())
+        .collect::<Vec<_>>();
+    assert!(leaked.is_empty(), "tags leaked into the text: {leaked:?}");
+
+    let image = document
+        .rows()
+        .iter()
+        .find_map(|row| row.image.as_ref())
+        .expect("the fixture draws an image");
+    assert_eq!(image.width, Some(96));
+    assert_eq!(image.height, Some(72));
+    assert!(
+        document
+            .rows()
+            .iter()
+            .any(|row| row.alignment == Alignment::Center),
+        "the fixture centers its header"
+    );
+    assert!(
+        document.rows().iter().any(|row| row.task == Some(true)),
+        "the fixture has a checked task"
+    );
+    assert!(
+        document
+            .rows()
+            .iter()
+            .flat_map(|row| row.runs.iter())
+            .any(|run| run.style.strikethrough),
+        "the fixture has struck text"
+    );
+    assert_eq!(document.tables().len(), 1, "the fixture has one table");
+}
+
+/// Whether text still holds an opening tag, a closing tag, or a comment.
+///
+/// A bare `<` in prose is not a tag, so the next character has to be a letter,
+/// `/`, or `!`.
+fn contains_html_tag(text: &str) -> bool {
+    text.char_indices().any(|(index, character)| {
+        character == '<'
+            && text[index + 1..]
+                .chars()
+                .next()
+                .is_some_and(|next| next.is_ascii_alphabetic() || next == '/' || next == '!')
+    })
+}

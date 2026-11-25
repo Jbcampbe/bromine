@@ -154,7 +154,7 @@ pub(crate) fn build_runs(
                 .as_ref()
                 .is_some_and(|range| start >= range.start && start < range.end);
 
-            let mut run_font = if style.code || style.raw || base.monospace {
+            let mut run_font = if style.code || base.monospace {
                 font(theme::monospace())
             } else {
                 font(theme::prose_font())

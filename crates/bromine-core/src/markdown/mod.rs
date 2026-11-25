@@ -62,6 +62,8 @@ pub struct Block {
     pub rows: Range<usize>,
     /// Index into [`MarkdownDocument::tables`] when this is a table.
     pub table: Option<usize>,
+    /// The alignment an HTML `align` attribute asked for.
+    pub alignment: Alignment,
 }
 
 /// How a list item is marked.
@@ -100,8 +102,6 @@ pub struct RunStyle {
     pub code: bool,
     pub strikethrough: bool,
     pub link: Option<String>,
-    /// Raw HTML, which is shown in the monospace face and never executed.
-    pub raw: bool,
     /// A hidden marker, only present while a block is active.
     pub marker: bool,
 }
@@ -141,6 +141,13 @@ pub struct ImageInfo {
     pub alt: String,
     pub destination: String,
     pub location: ImageLocation,
+    /// A pixel width from an HTML `width` attribute.
+    pub width: Option<u32>,
+    /// A pixel height from an HTML `height` attribute.
+    pub height: Option<u32>,
+    /// Whether the alt text is a Markdown caption worth drawing below the
+    /// image. HTML alt text is an accessibility label, not a caption.
+    pub caption: bool,
 }
 
 /// One source line, rendered.
@@ -163,6 +170,8 @@ pub struct Row {
     pub task: Option<bool>,
     /// Present when this row draws an image.
     pub image: Option<ImageInfo>,
+    /// The alignment an HTML `align` attribute asked for.
+    pub alignment: Alignment,
 }
 
 impl Row {
@@ -272,8 +281,9 @@ impl Row {
 }
 
 /// The alignment of one table column.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Alignment {
+    #[default]
     None,
     Left,
     Center,

@@ -215,7 +215,17 @@ word processor with a toolbar.
 - **Images are blocks.** A local path resolves relative to the Markdown file;
   `http` and `https` go through the shared image loader. A missing or failed
   image leaves a bordered placeholder with the alt text and the destination,
-  because a blank hole says less than an explanation.
+  because a blank hole says less than an explanation. A local path is handed to
+  the loader as a path, never as a string: GPUI treats a non-URI string as an
+  embedded resource and would silently look in the app bundle.
+- **HTML is content, not chrome.** GitHub accepts raw HTML in Markdown, and
+  README files use it for centred headers, badges, and images. Tags become gaps
+  in the source map, their contents become ordinary styled runs, and only the
+  tags that change layout (`p`, `div`, headings, `hr`, `br`, `img`) affect the
+  row. Script and style contents are dropped rather than shown as prose. It is
+  a sanitized subset, not a browser: `<details>` keeps its text but does not
+  collapse, and a bare URL stays plain text rather than becoming a GFM
+  autolink.
 - **A very large file is read only.** Past 2 MB or 20,000 rows the view falls
   back to monospace lines and says why. An instant, honest refusal is better
   than a window that freezes while it shapes the file.

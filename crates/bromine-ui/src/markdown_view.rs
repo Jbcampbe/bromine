@@ -844,6 +844,22 @@ impl MarkdownView {
             return div().into_any_element();
         }
 
+        // A line that only carried opening or closing HTML tags is syntax, not
+        // content. Collapsing it keeps a run of `<p>` wrappers from adding
+        // blank lines to the page; the active block still reveals the tag.
+        if row.kind == RowKind::Html
+            && self.active_block != Some(row.block)
+            && row.text.trim().is_empty()
+        {
+            return div().into_any_element();
+        }
+
+        let align = match row.alignment {
+            Alignment::Center => TextAlign::Center,
+            Alignment::Right => TextAlign::Right,
+            _ => TextAlign::Left,
+        };
+
         let block = self.document.block(row.block);
         let is_first_in_block = block
             .map(|block| block.rows.start == index)
@@ -961,7 +977,7 @@ impl MarkdownView {
             visual.font_size,
             visual.line_height,
             visual.caret,
-            TextAlign::Left,
+            align,
         );
 
         let mut content = div().flex_1().min_w(px(0.0));
@@ -1654,6 +1670,65 @@ mod tests {
 
         assert_eq!(text(cx, &view), "- [x] task\n");
         assert!(cx.update(|_window, app| view.read(app).is_dirty()));
+    }
+
+    #[gpui::test]
+    fn html_blocks_draw_their_text_without_their_tags(cx: &mut TestAppContext) {
+        let (view, cx) = view(
+            cx,
+            "<p align=\"center\">\n  <strong>Hello</strong> <em>world</em>\n</p>\n",
+        );
+        draw(cx);
+
+        let rows = cx.update(|_window, app| {
+            view.read(app)
+                .document()
+                .rows()
+                .iter()
+                .map(|row| (row.text.clone(), row.alignment))
+                .collect::<Vec<_>>()
+        });
+        let text = rows
+            .iter()
+            .map(|(text, _)| text.as_str())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(!text.contains('<'), "HTML tags must stay hidden: {text:?}");
+        assert!(text.contains("Hello world"), "{text:?}");
+        assert!(
+            rows.iter()
+                .any(|(_, alignment)| *alignment == bromine_core::Alignment::Center)
+        );
+    }
+
+    #[gpui::test]
+    fn an_html_image_draws_on_its_own_row(cx: &mut TestAppContext) {
+        let document = MarkdownDocument::from_str(
+            Path::new("fixtures/html.md"),
+            "<p align=\"center\">\n  <img src=\"diagram.svg\" width=\"64\" alt=\"Diagram\">\n</p>\n",
+        );
+        let (view, cx) = cx.add_window_view(|_window, cx| {
+            MarkdownView::new(PathBuf::from("fixtures/html.md"), document, cx)
+        });
+        cx.update(|_window, app| crate::text_actions::bind_text_editor_keys(app));
+        let handle = cx.update(|_window, app| view.read(app).focus_handle().clone());
+        cx.update(|window, _app| handle.focus(window));
+
+        draw(cx);
+
+        let image = cx.update(|_window, app| {
+            view.read(app)
+                .document()
+                .rows()
+                .iter()
+                .find_map(|row| row.image.clone())
+        });
+        let image = image.expect("the HTML image becomes an image row");
+        assert_eq!(image.width, Some(64));
+        assert!(matches!(
+            image.location,
+            bromine_core::ImageLocation::Local(path) if path.ends_with("fixtures/diagram.svg")
+        ));
     }
 
     #[gpui::test]

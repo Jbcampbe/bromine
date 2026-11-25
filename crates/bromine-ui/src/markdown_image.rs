@@ -7,7 +7,9 @@
 //! take the document with it.
 
 use bromine_core::{ImageInfo, ImageLocation};
-use gpui::{AnyElement, IntoElement, ObjectFit, StyledImage, div, img, prelude::*, px};
+use gpui::{
+    AnyElement, ImageSource, IntoElement, ObjectFit, StyledImage, div, img, prelude::*, px,
+};
 
 use crate::markdown_view::COLUMN_MAX_WIDTH;
 use crate::theme;
@@ -16,16 +18,12 @@ const IMAGE_MAX_HEIGHT: f32 = 320.0;
 
 /// Render one image with its caption, or a placeholder describing why not.
 pub(crate) fn image_element(info: &ImageInfo) -> AnyElement {
-    let destination = match &info.location {
-        ImageLocation::Local(path) => path.to_string_lossy().into_owned(),
-        ImageLocation::Remote(url) => url.clone(),
-        ImageLocation::Unresolved(url) => {
-            return placeholder(&info.alt, url, "this image cannot be loaded");
-        }
+    let Some((source, destination)) = image_source(info) else {
+        return placeholder(&info.alt, &info.destination, "this image cannot be loaded");
     };
 
     let alt = info.alt.clone();
-    let fallback_destination = destination.clone();
+    let fallback_destination = destination;
     let fallback_alt = alt.clone();
     let loading = || {
         div()
@@ -47,12 +45,18 @@ pub(crate) fn image_element(info: &ImageInfo) -> AnyElement {
         )
     };
 
-    let picture = img(destination)
-        .max_w(px(COLUMN_MAX_WIDTH - 64.0))
-        .max_h(px(IMAGE_MAX_HEIGHT))
-        .object_fit(ObjectFit::Contain)
-        .with_loading(loading)
-        .with_fallback(fallback);
+    let mut picture = img(source).object_fit(ObjectFit::Contain);
+    picture = match (info.width, info.height) {
+        (Some(width), Some(height)) => picture.w(px(width as f32)).h(px(height as f32)),
+        (Some(width), None) => picture.w(px(width as f32)).max_h(px(IMAGE_MAX_HEIGHT)),
+        (None, Some(height)) => picture
+            .max_w(px(COLUMN_MAX_WIDTH - 64.0))
+            .h(px(height as f32)),
+        (None, None) => picture
+            .max_w(px(COLUMN_MAX_WIDTH - 64.0))
+            .max_h(px(IMAGE_MAX_HEIGHT)),
+    };
+    let picture = picture.with_loading(loading).with_fallback(fallback);
 
     let mut container = div()
         .w_full()
@@ -61,7 +65,7 @@ pub(crate) fn image_element(info: &ImageInfo) -> AnyElement {
         .items_center()
         .py_2()
         .child(picture);
-    if !info.alt.is_empty() {
+    if info.caption && !info.alt.is_empty() {
         container = container.child(
             div()
                 .mt_1()
@@ -71,6 +75,21 @@ pub(crate) fn image_element(info: &ImageInfo) -> AnyElement {
         );
     }
     container.into_any_element()
+}
+
+/// The source GPUI should load, plus a label for the fallback.
+///
+/// A local path has to stay a `PathBuf`: GPUI treats a `String` that is not a
+/// URI as an embedded resource name, so a filesystem path passed as a string
+/// would never reach the disk.
+fn image_source(info: &ImageInfo) -> Option<(ImageSource, String)> {
+    match &info.location {
+        ImageLocation::Local(path) => {
+            Some((path.clone().into(), path.to_string_lossy().into_owned()))
+        }
+        ImageLocation::Remote(url) => Some((url.clone().into(), url.clone())),
+        ImageLocation::Unresolved(_) => None,
+    }
 }
 
 fn placeholder(alt: &str, destination: &str, explanation: &str) -> AnyElement {
@@ -110,4 +129,50 @@ fn placeholder(alt: &str, destination: &str, explanation: &str) -> AnyElement {
         );
     }
     box_element.into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::Resource;
+    use std::path::PathBuf;
+
+    fn info(location: ImageLocation) -> ImageInfo {
+        ImageInfo {
+            alt: String::new(),
+            destination: String::new(),
+            location,
+            width: None,
+            height: None,
+            caption: false,
+        }
+    }
+
+    #[test]
+    fn a_local_image_keeps_its_filesystem_path() {
+        let info = info(ImageLocation::Local(PathBuf::from("/tmp/diagram.png")));
+        let (source, _) = image_source(&info).expect("a local path has a source");
+
+        match source {
+            ImageSource::Resource(Resource::Path(path)) => {
+                assert_eq!(&*path, std::path::Path::new("/tmp/diagram.png"));
+            }
+            _ => panic!("a local image must be a filesystem path, not an embedded resource"),
+        }
+    }
+
+    #[test]
+    fn a_remote_image_is_a_uri() {
+        let info = info(ImageLocation::Remote(
+            "https://example.com/badge.png".into(),
+        ));
+        let (source, _) = image_source(&info).expect("a URL has a source");
+
+        assert!(matches!(source, ImageSource::Resource(Resource::Uri(_))));
+    }
+
+    #[test]
+    fn an_unresolved_image_has_no_source() {
+        assert!(image_source(&info(ImageLocation::Unresolved("data:x".into()))).is_none());
+    }
 }

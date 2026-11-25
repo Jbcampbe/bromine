@@ -271,7 +271,9 @@ them after an upgrade.
   `actions!`.** `actions!(text_editor, [Backspace])` creates a `Backspace` type
   in the current module; import it as `crate::text_actions::Backspace`.
 - **`ImageSource` accepts a path or a URI.** `img(path_buf)` loads a local file
-  and `img("https://…")` loads a remote one through the app's image loader.
+  and `img("https://…")` loads a remote one through the app's image loader. A
+  `String` that is not a URI becomes `Resource::Embedded`, so a filesystem path
+  must stay a `PathBuf` or it will be looked for inside the app bundle.
   `Img` implements `Styled` (so `max_w`/`max_h` work) and `StyledImage`
   (`with_loading`, `with_fallback`, `object_fit`). Loading and fallback closures
   return `AnyElement`.

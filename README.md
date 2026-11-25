@@ -111,6 +111,10 @@ quiet to read, literal to edit.
 - **Images are blocks.** A relative path resolves beside the Markdown file, and
   `http(s)` images load through the same cache. A missing image leaves a
   bordered placeholder with its alt text and destination instead of a hole.
+- **GitHub-flavoured Markdown, including HTML.** Tables, task lists,
+  strikethrough, footnotes, and the raw HTML that README files use for centred
+  headers and badges all read as content. Tags are never shown as text and never
+  executed; `align`, headings, rules, and `<img>` still do their job.
 - **`Cmd+B` and `Cmd+I`** wrap the selection, and a document over 2 MB or
   20,000 rows opens read-only with the reason in the status strip.
 

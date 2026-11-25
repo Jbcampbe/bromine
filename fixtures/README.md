@@ -16,6 +16,7 @@ fails.
 | `notes.md` | Headings, inline styles, quotes, lists and tasks, a fenced block, a table, and a local image. |
 | `table.md` | A table on its own, with one alignment of each kind. |
 | `remote.md` | A remote image, for the loading and network-failure paths. |
+| `html.md` | Raw HTML blocks and inline tags, GFM tables, tasks, strikethrough, footnotes, and an alert. |
 | `diagram.svg` | The local image `notes.md` points at. |
 | `readme.txt` | Plain text with tabs and a very long line, for horizontal scrolling. |
 | `crlf.txt` | CRLF line endings, so a save can be checked byte for byte. |
