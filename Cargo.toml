@@ -14,9 +14,15 @@ bromine-ui = { path = "crates/bromine-ui" }
 
 anyhow = "1"
 csv = "1.4"
+futures = "0.3"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 thiserror = "2"
 unicode-segmentation = "1"
+
+# GPUI's default HTTP client refuses every request, so the app supplies this
+# one for remote images. The package is a fork of reqwest already in the
+# dependency graph through GPUI, and the features match what GPUI asks for.
+reqwest = { version = "0.12.15-zed", package = "zed-reqwest", default-features = false, features = ["blocking", "charset", "http2", "macos-system-configuration", "multipart", "rustls-tls-native-roots", "socks", "stream"] }
 
 # `preserve_order` is a correctness requirement, not a nicety: a JSON viewer
 # that silently re-sorts keys alphabetically shows the user a document that is

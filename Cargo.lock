@@ -684,8 +684,10 @@ dependencies = [
  "anyhow",
  "bromine-core",
  "bromine-ui",
+ "futures",
  "gpui",
  "url",
+ "zed-reqwest",
 ]
 
 [[package]]
@@ -7109,6 +7111,7 @@ dependencies = [
  "base64",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "h2",

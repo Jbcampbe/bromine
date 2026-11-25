@@ -277,6 +277,11 @@ them after an upgrade.
   `Img` implements `Styled` (so `max_w`/`max_h` work) and `StyledImage`
   (`with_loading`, `with_fallback`, `object_fit`). Loading and fallback closures
   return `AnyElement`.
+- **GPUI's default HTTP client refuses every request.** `Application::new()`
+  installs a `NullHttpClient`, so a remote image or URL stays a placeholder
+  until `cx.set_http_client(...)` supplies a real client. The binary does this
+  in `crates/bromine/src/http.rs` with a blocking `reqwest` client; the request
+  runs on its own thread so a slow host cannot stall the UI executor.
 - **`uniform_list` needs a `UniformListScrollHandle`.** Its `track_scroll` will
   not take a plain `ScrollHandle`, so the read-only Markdown fallback lets the
   list own its scrolling rather than trying to drive it.

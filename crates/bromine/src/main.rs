@@ -9,11 +9,13 @@
 //! inside it with Cmd+O.
 
 mod cli;
+mod http;
 mod open_urls;
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use bromine_ui::{CloseTab, OpenFile, Quit, Save, Workspace, bind_text_editor_keys};
 use gpui::{
@@ -143,6 +145,14 @@ fn main() {
         }
     });
     app.run(move |cx| {
+        // GPUI's default client refuses every request, which leaves remote
+        // images as placeholders. A real client makes the badge and remote
+        // image paths work.
+        match http::ReqwestClient::new() {
+            Ok(client) => cx.set_http_client(Arc::new(client)),
+            Err(error) => eprintln!("bromine: could not create the HTTP client: {error}"),
+        }
+
         // Global, unbound-by-context shortcuts, so they work no matter which
         // tab has focus.
         cx.bind_keys([

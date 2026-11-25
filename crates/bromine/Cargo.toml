@@ -14,5 +14,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 bromine-core.workspace = true
 bromine-ui.workspace = true
+futures.workspace = true
 gpui.workspace = true
+reqwest.workspace = true
 url.workspace = true
