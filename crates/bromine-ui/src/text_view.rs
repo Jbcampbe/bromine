@@ -10,13 +10,13 @@ use std::path::{Path, PathBuf};
 
 use bromine_core::TextDocument;
 use gpui::{
-    App, Bounds, Context, Div, ElementId, FocusHandle, MouseButton, MouseDownEvent, MouseMoveEvent,
+    Bounds, Context, Div, ElementId, FocusHandle, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, Point, Render, ScrollHandle, ScrollWheelEvent, SharedString, Stateful,
     StyledText, TextRun, TextSystem, UTF16Selection, UnderlineStyle, Window, div, font, point,
     prelude::*, px,
 };
 
-use crate::editor::{self, EditorState, TextInputBridge};
+use crate::editor::{self, EditorState};
 use crate::text_actions::{
     Backspace, Copy, Cut, Delete, DocumentEnd, DocumentStart, Down, End, Enter, Home, Left,
     Outdent, Paste, Redo, Right, SelectAll, SelectDown, SelectEnd, SelectHome, SelectLeft,
@@ -846,10 +846,10 @@ impl Render for TextView {
             .on_action(cx.listener(Self::act_paste))
             .on_action(cx.listener(Self::act_undo))
             .on_action(cx.listener(Self::act_redo))
-            .child(InputBridgeElement {
-                view: cx.entity(),
-                focus_handle: self.focus_handle.clone(),
-            })
+            .child(editor::InputBridgeElement::new(
+                cx.entity(),
+                self.focus_handle.clone(),
+            ))
             .child(self.body(focused, cx))
             .child(self.status_strip())
     }
@@ -983,86 +983,6 @@ impl gpui::EntityInputHandler for TextView {
     ) -> Option<usize> {
         let offset = self.offset_for_position(position);
         Some(editor::offset_to_utf16(self.document.text(), offset))
-    }
-}
-
-/// Paint the platform input handler for the view. Kept as a free function so
-/// the custom row element below can call it during paint.
-fn bridge(
-    view: gpui::Entity<TextView>,
-    focus: &FocusHandle,
-    bounds: Bounds<gpui::Pixels>,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    TextInputBridge::paint(view, focus, bounds, window, cx);
-}
-
-/// The custom element that makes the view a text input and paints nothing.
-///
-/// It exists because GPUI only installs the platform input handler while an
-/// element paints. A transparent measured layout is enough: the rows below
-/// draw the text themselves.
-struct InputBridgeElement {
-    view: gpui::Entity<TextView>,
-    focus_handle: FocusHandle,
-}
-
-impl IntoElement for InputBridgeElement {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
-impl gpui::Element for InputBridgeElement {
-    type RequestLayoutState = ();
-    type PrepaintState = ();
-
-    fn id(&self) -> Option<ElementId> {
-        None
-    }
-
-    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
-        None
-    }
-
-    fn request_layout(
-        &mut self,
-        _id: Option<&gpui::GlobalElementId>,
-        _inspector_id: Option<&gpui::InspectorElementId>,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
-        let mut style = gpui::Style::default();
-        style.size.width = gpui::relative(1.0).into();
-        style.size.height = px(0.0).into();
-        (window.request_layout(style, [], cx), ())
-    }
-
-    fn prepaint(
-        &mut self,
-        _id: Option<&gpui::GlobalElementId>,
-        _inspector_id: Option<&gpui::InspectorElementId>,
-        _bounds: Bounds<gpui::Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
-        _window: &mut Window,
-        _cx: &mut App,
-    ) -> Self::PrepaintState {
-    }
-
-    fn paint(
-        &mut self,
-        _id: Option<&gpui::GlobalElementId>,
-        _inspector_id: Option<&gpui::InspectorElementId>,
-        bounds: Bounds<gpui::Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
-        _prepaint: &mut Self::PrepaintState,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
-        bridge(self.view.clone(), &self.focus_handle, bounds, window, cx);
     }
 }
 

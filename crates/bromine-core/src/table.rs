@@ -24,6 +24,31 @@ pub struct Repairs {
     pub unnamed_columns: usize,
 }
 
+/// Where a new column's cells landed, row by row.
+///
+/// A row shorter than the insertion index gets its cell appended to its own
+/// end rather than padded out to the index, so undo has to remove each cell
+/// from the slot it actually went to. The name is kept so redo can insert the
+/// same column again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnInsertion {
+    pub index: usize,
+    pub name: String,
+    pub slots: Vec<usize>,
+}
+
+/// A removed column, and which rows had a cell at that index.
+///
+/// Rows shorter than the index are left alone by a removal, so `cells` holds
+/// `None` for them; a restore has to skip those rows too or the table stops
+/// being the shape it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnRemoval {
+    pub index: usize,
+    pub name: String,
+    pub cells: Vec<Option<String>>,
+}
+
 impl Table {
     /// Build a table from headers and rows, trimming or padding every row to
     /// match `headers`.
@@ -168,22 +193,26 @@ impl Table {
     /// Every row gains a cell at the same position, including rows that are
     /// still shorter than the requested index: a ragged row is clamped to its
     /// own end instead of being padded, so one bad record cannot abort the
-    /// edit for the whole table.
-    pub fn insert_column(&mut self, index: usize, name: String) -> usize {
+    /// edit for the whole table. The returned [`ColumnInsertion`] records the
+    /// slot each cell landed in, which is what [`Self::undo_column_insert`]
+    /// needs to put the table back exactly.
+    pub fn insert_column(&mut self, index: usize, name: String) -> ColumnInsertion {
         let index = index.min(self.headers.len());
-        self.headers.insert(index, name);
+        self.headers.insert(index, name.clone());
+        let mut slots = Vec::with_capacity(self.rows.len());
         for row in &mut self.rows {
             let at = index.min(row.len());
             row.insert(at, String::new());
+            slots.push(at);
         }
-        index
+        ColumnInsertion { index, name, slots }
     }
 
-    /// Remove a column and return its header name.
+    /// Remove a column and return its header name and the cells it held.
     ///
     /// Rows shorter than the column have nothing at that index, so they are
     /// left alone rather than being padded just to be cut again.
-    pub fn remove_column(&mut self, index: usize) -> Result<String, CoreError> {
+    pub fn remove_column(&mut self, index: usize) -> Result<ColumnRemoval, CoreError> {
         let columns = self.column_count();
         if index >= columns {
             return Err(CoreError::NoSuchColumn {
@@ -191,12 +220,64 @@ impl Table {
                 columns,
             });
         }
+        let mut cells = Vec::with_capacity(self.rows.len());
         for row in &mut self.rows {
-            if index < row.len() {
-                row.remove(index);
+            cells.push(if index < row.len() {
+                Some(row.remove(index))
+            } else {
+                None
+            });
+        }
+        Ok(ColumnRemoval {
+            index,
+            name: self.headers.remove(index),
+            cells,
+        })
+    }
+
+    /// The inverse of [`Self::insert_column`].
+    pub fn undo_column_insert(&mut self, insertion: &ColumnInsertion) {
+        if insertion.index < self.headers.len() {
+            self.headers.remove(insertion.index);
+        }
+        for (row, slot) in self.rows.iter_mut().zip(&insertion.slots) {
+            if *slot < row.len() {
+                row.remove(*slot);
             }
         }
-        Ok(self.headers.remove(index))
+    }
+
+    /// The inverse of [`Self::remove_column`].
+    ///
+    /// Refuses when the table no longer has the rows the removal was taken
+    /// from: replaying it onto a different shape would put a value in the wrong
+    /// cell, which is worse than reporting that the edit is stale.
+    pub fn restore_column(&mut self, removal: ColumnRemoval) -> Result<(), CoreError> {
+        if removal.cells.len() != self.rows.len() {
+            return Err(CoreError::StaleEdit {
+                expected: removal.cells.len(),
+                found: self.rows.len(),
+            });
+        }
+        self.headers.insert(removal.index, removal.name);
+        for (row, cell) in self.rows.iter_mut().zip(removal.cells) {
+            if let Some(value) = cell {
+                let at = removal.index.min(row.len());
+                row.insert(at, value);
+            }
+        }
+        Ok(())
+    }
+
+    /// The inverse of [`Self::remove_row`]: put a removed row back.
+    ///
+    /// Returns the index the row landed at, which is the requested index
+    /// clamped to the table, because a caller that replayed an edit still needs
+    /// to know where it went.
+    pub fn restore_row(&mut self, index: usize, cells: Vec<String>) -> usize {
+        let index = index.min(self.rows.len());
+        self.rows.insert(index, cells);
+        index
     }
 
     /// True when every cell in the row is empty after trimming.
@@ -358,7 +439,7 @@ mod tests {
             ],
         };
 
-        assert_eq!(table.insert_column(1, "rank".into()), 1);
+        assert_eq!(table.insert_column(1, "rank".into()).index, 1);
         assert_eq!(table.header(1), Some("rank"));
         assert_eq!(table.column_count(), 3);
 
@@ -389,7 +470,12 @@ mod tests {
         );
 
         let removed = table.remove_column(1).unwrap();
-        assert_eq!(removed, "role");
+        assert_eq!(removed.name, "role");
+        assert_eq!(removed.index, 1);
+        assert_eq!(
+            removed.cells,
+            vec![Some("engineer".to_string()), Some("admiral".to_string())]
+        );
         assert_eq!(table.column_count(), 2);
         assert_eq!(table.header(1), Some("city"));
         // The neighbour after the hole must still hold the value that was
@@ -415,7 +501,8 @@ mod tests {
         };
 
         let removed = table.remove_column(1).unwrap();
-        assert_eq!(removed, "role");
+        assert_eq!(removed.name, "role");
+        assert_eq!(removed.cells, vec![None, Some("admiral".to_string())]);
         // The short row never had the column, so it stays one cell wide.
         assert_eq!(table.row(0).unwrap().to_vec(), vec!["ada".to_string()]);
         assert_eq!(table.row(1).unwrap().to_vec(), vec!["grace".to_string()]);
@@ -459,7 +546,7 @@ mod tests {
     #[test]
     fn insert_column_on_a_zero_column_table_gives_every_row_one_cell() {
         let mut table = Table::default();
-        assert_eq!(table.insert_column(99, "name".into()), 0);
+        assert_eq!(table.insert_column(99, "name".into()).index, 0);
         assert_eq!(table.column_count(), 1);
         assert_eq!(table.header(0), Some("name"));
         assert_eq!(table.row_count(), 0);
@@ -472,8 +559,95 @@ mod tests {
         let mut rows_first = Table::default();
         rows_first.insert_row(0);
         rows_first.insert_row(1);
-        assert_eq!(rows_first.insert_column(0, "name".into()), 0);
+        assert_eq!(rows_first.insert_column(0, "name".into()).index, 0);
         assert_eq!(rows_first.row(0).unwrap().len(), 1);
         assert_eq!(rows_first.row(1).unwrap().len(), 1);
+    }
+
+    /// A table the public constructors cannot make: rows of different widths,
+    /// which is what a column insertion into ragged input leaves behind.
+    fn ragged() -> Table {
+        Table {
+            headers: vec!["name".into(), "role".into()],
+            rows: vec![
+                vec!["ada".into()],
+                vec!["grace".into(), "admiral".into(), "extra".into()],
+                vec![],
+            ],
+        }
+    }
+
+    #[test]
+    fn a_column_insertion_records_the_slot_each_cell_landed_in() {
+        let mut table = ragged();
+        let insertion = table.insert_column(1, "rank".into());
+
+        assert_eq!(insertion.index, 1);
+        assert_eq!(insertion.name, "rank");
+        // Row 0 is one wide, so its cell went to slot 1; row 1 had room at 1;
+        // row 2 is empty, so its cell went to the only slot there is.
+        assert_eq!(insertion.slots, vec![1, 1, 0]);
+    }
+
+    #[test]
+    fn undoing_a_column_insert_restores_a_ragged_table_exactly() {
+        let mut table = ragged();
+        let before = table.clone();
+
+        let insertion = table.insert_column(1, "rank".into());
+        table.undo_column_insert(&insertion);
+
+        assert_eq!(table, before);
+    }
+
+    #[test]
+    fn undoing_a_column_insert_at_the_end_restores_a_ragged_table_exactly() {
+        let mut table = ragged();
+        let before = table.clone();
+
+        let insertion = table.insert_column(99, "rank".into());
+        table.undo_column_insert(&insertion);
+
+        assert_eq!(table, before);
+    }
+
+    #[test]
+    fn restoring_a_removed_column_puts_back_only_the_rows_that_had_a_cell() {
+        let mut short = ragged();
+        let before = short.clone();
+
+        let removal = short.remove_column(1).unwrap();
+        assert_eq!(removal.cells, vec![None, Some("admiral".to_string()), None]);
+        short.restore_column(removal).unwrap();
+
+        assert_eq!(short, before);
+    }
+
+    #[test]
+    fn restoring_a_removed_row_puts_its_cells_back_where_they_were() {
+        let mut table = ragged();
+        let before = table.clone();
+
+        let cells = table.remove_row(1).unwrap();
+        table.restore_row(1, cells);
+
+        assert_eq!(table, before);
+    }
+
+    #[test]
+    fn restoring_a_column_onto_a_different_shape_is_refused() {
+        let mut table = ragged();
+        let removal = table.remove_column(0).unwrap();
+        table.remove_row(1).unwrap();
+
+        assert!(matches!(
+            table.restore_column(removal),
+            Err(CoreError::StaleEdit {
+                expected: 3,
+                found: 2
+            })
+        ));
+        // A refusal must not half-apply the edit.
+        assert_eq!(table.column_count(), 1);
     }
 }

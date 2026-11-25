@@ -103,9 +103,10 @@ hierarchy, not a new scale for the app.
   controls: a bar you can drag is a later increment.
 - A status strip along the bottom carrying the row and column counts, the row
   and column edit buttons, the saved state, any repair warning, and, for a view
-  that cannot write, a read only notice. The file name lives in the tab, so it is
-  not repeated here, and the status strip sits below the grid so the eye finds
-  nothing between the tabs and the data.
+  that cannot write, a read only notice. While a cell is open it also names that
+  cell, the way a spreadsheet's name box does. The file name lives in the tab, so
+  it is not repeated here, and the status strip sits below the grid so the eye
+  finds nothing between the tabs and the data.
 - Row numbers down the left edge and column letters along the top, in the
   convention every spreadsheet shares: numbers count from one and do not scroll
   sideways, letters read `A` to `Z` then `AA`. A reader who has used Excel or
@@ -132,14 +133,30 @@ hierarchy, not a new scale for the app.
   it turn `accent`, so a mark inside a wide row still says where it started.
 - Cmd+C copies the mark as text: a cell as its value, a row as tab-separated
   values, a column as one value per line. Tab and newline are the shapes a
-  spreadsheet and a text editor paste back into place.
+  spreadsheet and a text editor paste back into place. With a cell open it copies
+  the selected part of that value instead, because a caret's selection outranks
+  the mark.
 - Sorting or filtering drops the mark, because a position stops naming the same
   row the moment the order or the filter changes.
-- Structural edits come before cell editing: add and remove rows and columns
-  from the status strip. A new row is empty and a new column takes its position
-  as a name. Typing into a CSV cell needs the text-input foundation (caret,
-  selection, undo), which now exists in the text and Markdown views, and is not
-  faked with a half-working field until the grid has its own increment.
+- A cell is edited in place. Double-clicking it, or marking it and pressing
+  Enter, opens the value under a caret; Escape puts the value back exactly as it
+  was. Enter commits and steps one row down, Tab commits and steps one column
+  right, both because that is what every spreadsheet does and a grid that breaks
+  those keys costs the reader a habit. Clicking anywhere else commits too, and so
+  does sorting, filtering, saving, or a structural edit: no gesture may silently
+  throw away a half-typed value.
+- One exception to the mark's usual silence: while a cell is open the status
+  strip names it (`D7`), because the value under the caret says nothing about
+  where in the file it lives. The name is the same row and column the header and
+  gutter light up.
+- A cell holds one line. A paste or composition that contains a line break or a
+  tab is refused whole and explained in the strip, rather than being flattened
+  into something the file never contained.
+- Undo covers the grid, not just its cells. Typing, adding a row, and removing a
+  column share one history, because "undo" means the last thing that happened,
+  not the last thing that happened in the current category. Typing and runs of
+  backspace coalesce; moving the caret, switching cells, and committing start a
+  new step. Cancelling an edit leaves no step behind.
 - A new row lands below the marked row, or at the end of the file when nothing
   is marked. A new column lands to the right of the marked column, or at the
   right edge. Every edit is resolved against the table through the view, so a

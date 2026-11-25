@@ -1,7 +1,7 @@
-//! The editing foundation shared by the plain-text and Markdown views.
+//! The editing foundation shared by the text, Markdown, and CSV views.
 //!
 //! [`EditorState`] is the caret and selection; everything that changes the
-//! document lives in this module so both views behave the same way for typing,
+//! document lives in this module so every view behaves the same way for typing,
 //! deletion, undo, and clipboard operations. The views add only the parts that
 //! need their own layout: where a click lands, and how a wrapped line is found.
 
@@ -10,7 +10,7 @@ use std::ops::Range;
 use bromine_core::{EditKind, TextDocument};
 use gpui::{
     App, Bounds, ClipboardItem, ElementInputHandler, Entity, EntityInputHandler, FocusHandle,
-    Pixels, UTF16Selection, Window,
+    IntoElement, Pixels, UTF16Selection, Window,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -468,7 +468,7 @@ pub fn range_from_utf16(text: &str, range: &Range<usize>) -> Range<usize> {
 pub struct TextInputBridge;
 
 impl TextInputBridge {
-    pub fn paint<V: EntityInputHandler>(
+    pub fn paint<V: EntityInputHandler + 'static>(
         view: Entity<V>,
         focus_handle: &FocusHandle,
         bounds: Bounds<Pixels>,
@@ -476,6 +476,81 @@ impl TextInputBridge {
         cx: &mut App,
     ) {
         window.handle_input(focus_handle, ElementInputHandler::new(bounds, view), cx);
+    }
+}
+
+/// The custom element that makes a view a text input and paints nothing.
+///
+/// It exists because GPUI only installs the platform input handler while an
+/// element paints. Every view that edits text (the plain-text view, the Markdown
+/// view, and the CSV grid's cell editor) hangs one of these in its tree and
+/// draws its own text.
+pub struct InputBridgeElement<V: EntityInputHandler + 'static> {
+    view: Entity<V>,
+    focus_handle: FocusHandle,
+}
+
+impl<V: EntityInputHandler + 'static> InputBridgeElement<V> {
+    pub fn new(view: Entity<V>, focus_handle: FocusHandle) -> Self {
+        Self { view, focus_handle }
+    }
+}
+
+impl<V: EntityInputHandler + 'static> IntoElement for InputBridgeElement<V> {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl<V: EntityInputHandler + 'static> gpui::Element for InputBridgeElement<V> {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
+        let mut style = gpui::Style::default();
+        style.size.width = gpui::relative(1.0).into();
+        style.size.height = gpui::px(0.0).into();
+        (window.request_layout(style, [], cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Self::PrepaintState {
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        TextInputBridge::paint(self.view.clone(), &self.focus_handle, bounds, window, cx);
     }
 }
 

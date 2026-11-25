@@ -41,6 +41,12 @@ pub enum CoreError {
     #[error("row {row} does not exist (table has {rows} rows)")]
     NoSuchRow { row: usize, rows: usize },
 
+    /// A recorded edit no longer fits the table it is being replayed onto.
+    /// Replaying it anyway would write a value into a different cell than the
+    /// one the user changed, so it is refused instead.
+    #[error("this edit no longer fits the table (it expected {expected} rows and found {found})")]
+    StaleEdit { expected: usize, found: usize },
+
     /// The file holds NUL bytes near the start, so it is not text and no
     /// editor can show it without inventing a decoding.
     #[error("{path} looks like a binary file, so it cannot be shown as text")]

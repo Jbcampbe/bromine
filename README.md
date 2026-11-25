@@ -45,8 +45,9 @@ upload, no telemetry.
   200,000-row CSV is parsed once and only the visible rows are ever laid out.
 - **The spreadsheet conventions you already know.** Row numbers down the left
   edge, column letters `A` to `Z` to `AA` along the top, and a header that sorts.
-- **Enough editing to fix the file you opened.** Add or remove rows and columns,
-  then write it back with `Cmd+S`. No save-as-you-type.
+- **Enough editing to fix the file you opened.** Type into a cell, add or remove
+  rows and columns, undo any of it, then write it back with `Cmd+S`. No
+  save-as-you-type.
 - **Bad news, stated plainly.** Repaired rows, lossily decoded bytes, and
   read-only files show up in the status strip instead of disappearing.
 
@@ -74,6 +75,25 @@ wide row still says where it started.
 Scroll in one axis at a time: a trackpad gesture keeps the direction it started
 in, so a diagonal swipe does not drag the grid diagonally. Thin scrollbars along
 the right and bottom edges show where in the file you are.
+
+## Edit a cell
+
+Double-click a cell, or mark it and press `Enter`, and type. A double click puts
+the caret where the pointer is; `Enter` puts it at the end of the value. While a
+cell is open the arrow keys, `Home`/`End`, `Shift` to select, `Backspace` and
+`Delete`, and `Cmd+A`/`Cmd+C`/`Cmd+X`/`Cmd+V` work on the value instead of on the
+grid. `Enter` commits and steps one row down, `Tab` commits and steps one column
+right, clicking another cell commits, and `Escape` puts back the value the cell
+had when you opened it.
+
+A cell cannot hold a line break or a tab, so a paste that contains one is refused
+whole, with the reason in the status strip.
+
+With no cell open, typing still filters the table. The search box never needs a
+click to come back.
+
+Every edit shares one undo history: typing in a cell, adding a row, and removing
+a column all undo with `Cmd+Z` and redo with `Shift+Cmd+Z`.
 
 ## JSON, line by line
 
@@ -135,10 +155,12 @@ Keep several files open at once as tabs. `Cmd+O` opens files from a native panel
 tab instead of making a duplicate. Every tab keeps its own scroll, sort, and
 search.
 
-Rows and columns can be added and removed from the status strip. A new row lands
-below the marked row, or at the end of the file when nothing is marked; a new
-column lands to the right of the marked column. Edit first, then save: the strip
-says "unsaved changes" until `Cmd+S` has written the file.
+Rows and columns can be added and removed from the status strip, and any cell can
+be typed into. A new row lands below the marked row, or at the end of the file
+when nothing is marked; a new column lands to the right of the marked column.
+Edit first, then save: the strip says "unsaved changes" until `Cmd+S` has written
+the file. Sorting or filtering while a cell is open commits it first, so an edit
+is never lost to a header click.
 
 Closing a dirty tab, or quitting the app, asks twice. One keystroke must not be
 able to throw work away.
@@ -154,9 +176,9 @@ the file displayable.
   writing it back would replace bytes Bromine could not read.
 - Repairs made at load do not block a save: what gets written is the rectangle
   you are looking at.
-- Text and Markdown edits have undo and redo. Structural CSV edits do not yet,
-  so the app is blunt about unsaved work rather than pretending a row removal is
-  free.
+- Edits in the grid, the text view, and the Markdown view all have undo and redo,
+  so an edit-then-save file is recoverable keystroke by keystroke until it is
+  written.
 
 ## Install
 
@@ -201,11 +223,11 @@ in a trench coat.
 | `crates/bromine` | The binary: arguments, menu bar, file loading, and window setup. |
 
 That crate boundary is a hard rule, not an aspiration. Every behaviour worth
-trusting lives in core, where tests run headlessly. The full suite is **180
-tests**: 84 core, 10 fixture contracts, 75 views, and 11 CLI. The view tests drive
-real GPUI frames: they type into the window, click headers and status buttons,
-dispatch wheel events, send `Cmd+C`, `Cmd+S`, and `Cmd+W` through the real keymap,
-and assert on laid-out bounds.
+trusting lives in core, where tests run headlessly. The full suite is **238
+tests**: 116 core, 10 fixture contracts, 101 views, and 11 CLI. The view tests
+drive real GPUI frames: they type into the window, double-click a grid cell and
+edit it, click headers and status buttons, dispatch wheel events, send `Cmd+C`,
+`Cmd+S`, and `Cmd+W` through the real keymap, and assert on laid-out bounds.
 
 GPUI is pinned to exactly `0.2.2` and is not upgraded as a side effect. The
 workspace enables its `runtime_shaders` feature so the app builds with Xcode
@@ -226,11 +248,11 @@ After that, only what is on screen is drawn.
 Bromine is early, deliberately small, and open source. CSV/TSV, JSON, Markdown,
 and plain text are wired end to end. What is not there yet:
 
-- Typing into a CSV cell (the shared caret, selection, and undo foundation is
-  in place for the text and Markdown views)
 - Editing JSON, or collapsing it into a tree
-- Drag-selection that auto-scrolls past the viewport, a blinking caret, merged
-  or multi-line table cells, and inline images that flow inside a paragraph
+- Multi-cell selection, fill, and block paste in the grid, and drag-selection
+  that auto-scrolls past the viewport
+- A blinking caret, merged or multi-line table cells, and inline images that flow
+  inside a paragraph
 - Spellcheck, find, tags, and a focus mode for Markdown
 - Dragging column edges, draggable scrollbars, and reordering tabs
 - Searching inside a JSON document
@@ -298,10 +320,10 @@ compile cycle to learn. `DESIGN.md` records the visual brief.
 
 ```bash
 cargo build --release --target aarch64-apple-darwin -p bromine
-./scripts/bundle-macos.sh aarch64-apple-darwin 0.2.0 aarch64
+./scripts/bundle-macos.sh aarch64-apple-darwin 0.3.0 aarch64
 ```
 
-That writes `dist/Bromine.app` and `dist/Bromine-0.2.0-aarch64.dmg`. Set
+That writes `dist/Bromine.app` and `dist/Bromine-0.3.0-aarch64.dmg`. Set
 `SIGN_IDENTITY` to a Developer ID identity to sign with it instead of ad-hoc.
 The icon is regenerated from `assets/icon.svg` with `./scripts/make-icon.sh`
 (needs `rsvg-convert`).

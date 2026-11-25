@@ -14,6 +14,7 @@
 //!   edit always targets a stable absolute row index.
 
 mod csv;
+mod edits;
 mod error;
 mod json;
 mod markdown;
@@ -22,6 +23,7 @@ mod text;
 mod view;
 
 pub use csv::{CsvDocument, load_csv, parse_csv};
+pub use edits::{CaretMove, EditOutcome, StepId, TableEdits};
 pub use error::CoreError;
 pub use json::{JsonDocument, load_json, parse_json};
 pub use markdown::{
@@ -29,7 +31,7 @@ pub use markdown::{
     ListMarker, MarkdownDocument, Row, RowKind, Run, RunStyle, TableBlock, TableCell,
     load_markdown,
 };
-pub use table::{Repairs, Table};
+pub use table::{ColumnInsertion, ColumnRemoval, Repairs, Table};
 pub use text::{EditKind, LineEnding, TextDocument, UndoOutcome};
 pub use view::{Direction, RowView, SortKey, compare_values};
 

@@ -1,13 +1,25 @@
 //! The CSV grid: a virtualized, sortable, searchable view over a parsed table.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use bromine_core::{CsvDocument, Direction, RowView, SortKey};
+use bromine_core::{
+    CaretMove, CsvDocument, Direction, EditKind, EditOutcome, RowView, SortKey, StepId, Table,
+    TableEdits, UndoOutcome,
+};
 use gpui::{
-    ClipboardItem, Context, Div, ElementId, FocusHandle, Font, KeyDownEvent, MouseButton,
-    MouseDownEvent, Pixels, Render, ScrollHandle, ScrollWheelEvent, SharedString, Stateful,
-    TextSystem, TouchPhase, Window, div, font, point, prelude::*, px,
+    App, Bounds, ClipboardItem, Context, Div, ElementId, EntityInputHandler, FocusHandle, Font,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
+    ScrollHandle, ScrollWheelEvent, SharedString, Stateful, StyledText, TextRun, TextSystem,
+    TouchPhase, UTF16Selection, Window, div, font, point, prelude::*, px,
+};
+
+use crate::editor::{self, EditorState, TextBuffer};
+use crate::text_actions::{
+    Backspace, Copy, Cut, Delete, DocumentEnd, DocumentStart, Down, End, Enter, Home, Left,
+    Outdent, Paste, Redo, Right, SelectAll, SelectEnd, SelectHome, SelectLeft, SelectRight,
+    SelectWordLeft, SelectWordRight, Tab, Undo, Up, WordLeft, WordRight,
 };
 
 /// The axis a scroll gesture is allowed to move.
@@ -85,6 +97,179 @@ const LETTERS_HEIGHT: f32 = 20.0;
 
 /// A virtualized grid over a delimited file.
 ///
+/// The horizontal padding a cell gives its text, in pixels.
+///
+/// The cell div carries `px_2`; the number is named here because the caret
+/// maths has to agree with the padding exactly.
+const CELL_PADDING_X: f32 = 8.0;
+
+/// An open cell edit: which cell, where the caret is, and where the history
+/// stood when the session began.
+struct CellSession {
+    /// The absolute table row, not the view position: sorting does not move it.
+    row: usize,
+    column: usize,
+    editor: EditorState,
+    /// The history head when the session opened, so cancelling can discard
+    /// exactly the steps this session added.
+    opened_at: Option<StepId>,
+}
+
+/// The cell being edited, borrowed from the table so the shared editor helpers
+/// (typing, deletion, navigation, clipboard) work on a cell unchanged.
+///
+/// The text is the table cell itself rather than a view-side copy, so a save can
+/// never write something other than what is on screen and `cell_at` in the tests
+/// reads the live value.
+struct CellBuffer<'a> {
+    table: &'a mut Table,
+    edits: &'a mut TableEdits,
+    row: usize,
+    column: usize,
+}
+
+impl CellBuffer<'_> {
+    fn text(&self) -> &str {
+        self.table.get(self.row, self.column).unwrap_or_default()
+    }
+}
+
+impl editor::TextBuffer for CellBuffer<'_> {
+    fn buffer_text(&self) -> &str {
+        self.text()
+    }
+
+    fn buffer_len(&self) -> usize {
+        self.text().len()
+    }
+
+    fn buffer_slice(&self, range: Range<usize>) -> &str {
+        let range = clamp_range(self.text(), range);
+        &self.text()[range]
+    }
+
+    fn buffer_replace(
+        &mut self,
+        range: Range<usize>,
+        text: &str,
+        caret_before: usize,
+        _caret_after: usize,
+        kind: EditKind,
+    ) -> usize {
+        let current = self.text().to_string();
+        let range = clamp_range(&current, range);
+        let mut next = current;
+        next.replace_range(range.clone(), text);
+        let caret = (range.start + text.len()).min(next.len());
+        // A session only opens on a cell that exists and structural edits commit
+        // before they run, so this targets a live coordinate. A refusal would
+        // mean the row went away under the editor, and then there is no cell
+        // left to place a caret in.
+        let _ = self.edits.set_cell(
+            self.table,
+            self.row,
+            self.column,
+            &next,
+            CaretMove {
+                before: caret_before,
+                after: caret,
+            },
+            kind,
+        );
+        caret
+    }
+
+    fn buffer_undo(&mut self) -> Option<UndoOutcome> {
+        let outcome = self.edits.undo_cell(self.table, self.row, self.column)?;
+        Some(UndoOutcome {
+            range: 0..self.text().len(),
+            caret: outcome.caret.unwrap_or(0),
+        })
+    }
+
+    fn buffer_redo(&mut self) -> Option<UndoOutcome> {
+        let outcome = self.edits.redo_cell(self.table, self.row, self.column)?;
+        Some(UndoOutcome {
+            range: 0..self.text().len(),
+            caret: outcome.caret.unwrap_or(0),
+        })
+    }
+
+    // A cell is one line, so Home and End fall out of these for free.
+    fn buffer_line_of(&self, _offset: usize) -> usize {
+        0
+    }
+
+    fn buffer_line_start(&self, _line: usize) -> Option<usize> {
+        Some(0)
+    }
+
+    fn buffer_line_range(&self, line: usize) -> Option<Range<usize>> {
+        (line == 0).then(|| 0..self.text().len())
+    }
+}
+
+/// Measures cell text the way the grid draws it: one character at a time in the
+/// monospace cell font.
+///
+/// Resolving the font once and reusing the id keeps a per-frame caret
+/// measurement cheap, which is the only measurement an edit session adds.
+struct CellMetrics<'a> {
+    text_system: &'a TextSystem,
+    font_id: gpui::FontId,
+}
+
+impl<'a> CellMetrics<'a> {
+    fn new(text_system: &'a TextSystem) -> Self {
+        let font_id = text_system.resolve_font(&font(theme::monospace()));
+        Self {
+            text_system,
+            font_id,
+        }
+    }
+
+    fn advance(&self, ch: char) -> f32 {
+        let ch = if ch.is_control() { ' ' } else { ch };
+        self.text_system
+            .advance(self.font_id, px(CELL_FONT_SIZE), ch)
+            .map(|size| f32::from(size.width))
+            .unwrap_or(0.0)
+    }
+
+    fn prefix_width(&self, text: &str) -> f32 {
+        text.chars().map(|ch| self.advance(ch)).sum()
+    }
+
+    /// The byte offset nearest the horizontal position `x` inside `text`.
+    fn offset_for_x(&self, text: &str, x: f32) -> usize {
+        let mut edge = 0.0;
+        for (index, ch) in text.char_indices() {
+            let width = self.advance(ch);
+            if x < edge + width / 2.0 {
+                return index;
+            }
+            edge += width;
+        }
+        text.len()
+    }
+}
+
+/// The nearest byte boundary at or before `offset`.
+fn clamp_boundary(text: &str, offset: usize) -> usize {
+    let mut offset = offset.min(text.len());
+    while offset > 0 && !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
+}
+
+/// A byte range clamped to the text and to character boundaries.
+fn clamp_range(text: &str, range: Range<usize>) -> Range<usize> {
+    let start = clamp_boundary(text, range.start);
+    let end = clamp_boundary(text, range.end.max(start));
+    start..end
+}
+
 /// The grid owns the parsed document plus a [`RowView`] that decides which rows
 /// are visible and in what order. Nothing here reorders the table itself, so the
 /// row drawn at a given position can always be traced back to a stable table
@@ -116,8 +301,18 @@ pub struct CsvGrid {
     gutter_scroll: ScrollHandle,
     /// What the user has marked. Copying and the row and column edits read it.
     selection: Selection,
-    /// Whether the table has edits that are not on disk yet.
-    dirty: bool,
+    /// Undo for every edit this grid has made, cell or structural.
+    ///
+    /// Dirtiness is derived from its head rather than tracked as a flag, so
+    /// undoing back to the saved state clears the marker and a new edit after an
+    /// undo sets it again even when the number of steps looks the same.
+    edits: TableEdits,
+    /// The history head that was last written to disk.
+    saved_head: Option<StepId>,
+    /// The open cell edit, if any.
+    session: Option<CellSession>,
+    /// Why the last keystroke or paste was refused, shown in the status strip.
+    notice: Option<SharedString>,
     /// Why the last save did not happen, shown in the status strip.
     save_error: Option<SharedString>,
     focus_handle: FocusHandle,
@@ -138,7 +333,10 @@ impl CsvGrid {
             body_scroll: ScrollHandle::new(),
             gutter_scroll: ScrollHandle::new(),
             selection: Selection::None,
-            dirty: false,
+            edits: TableEdits::default(),
+            saved_head: None,
+            session: None,
+            notice: None,
             save_error: None,
             focus_handle: cx.focus_handle(),
         }
@@ -156,7 +354,7 @@ impl CsvGrid {
 
     /// Whether the table has edits that are not on disk yet.
     pub fn is_dirty(&self) -> bool {
-        self.dirty
+        self.edits.head() != self.saved_head
     }
 
     /// How many rows survive the current search.
@@ -198,6 +396,187 @@ impl CsvGrid {
     /// Give the grid keyboard focus.
     pub fn focus(&self, window: &mut Window) {
         self.focus_handle.focus(window);
+    }
+
+    /// Whether a cell edit is open.
+    pub fn is_editing(&self) -> bool {
+        self.session.is_some()
+    }
+
+    /// The cell the open session is editing, as a table coordinate.
+    fn session_cell(&self) -> Option<(usize, usize)> {
+        self.session
+            .as_ref()
+            .map(|session| (session.row, session.column))
+    }
+
+    /// The value a cell holds, or "" when the row or column is gone.
+    fn cell_text(&self, row: usize, column: usize) -> &str {
+        self.document.table.get(row, column).unwrap_or_default()
+    }
+
+    /// The window x where a cell's text begins.
+    fn cell_screen_left(&self, column: usize) -> f32 {
+        let viewport = f32::from(self.body_scroll.bounds().origin.x);
+        let scroll = f32::from(self.body_scroll.offset().x);
+        let widths: f32 = self.column_widths.iter().take(column).sum();
+        viewport + scroll + widths + CELL_PADDING_X
+    }
+
+    /// Start editing the cell at `position`.
+    ///
+    /// A click names the caret with `caret_x`; Enter puts it at the end, which
+    /// is where someone who wants to append expects it.
+    fn start_editing(
+        &mut self,
+        position: usize,
+        column: usize,
+        caret_x: Option<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(row) = self.view.table_row(position) else {
+            return;
+        };
+        let Some(text) = self.document.table.get(row, column) else {
+            return;
+        };
+        if self.column_widths.get(column).is_none() {
+            return;
+        }
+
+        let caret = match caret_x {
+            Some(x) => {
+                let metrics = CellMetrics::new(cx.text_system());
+                metrics.offset_for_x(text, f32::from(x) - self.cell_screen_left(column))
+            }
+            None => text.len(),
+        };
+
+        self.focus(window);
+        // A session is a new undo group: nothing typed in it may merge into a
+        // step from before, or cancelling could not discard exactly its work.
+        self.edits.break_group();
+        self.session = Some(CellSession {
+            row,
+            column,
+            editor: EditorState::new(caret),
+            opened_at: self.edits.head(),
+        });
+        self.selection = Selection::Cell { position, column };
+        self.notice = None;
+        self.save_error = None;
+        cx.notify();
+    }
+
+    /// Close the open session, keeping what was typed.
+    fn commit(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.session.take() else {
+            return;
+        };
+        self.edits.break_group();
+
+        // Only the committed column is measured again: a column that resized
+        // as you typed would make the table jump under the caret.
+        if let Some(width) = self.column_widths.get_mut(session.column) {
+            *width = measure_column(&self.document.table, session.column, cx.text_system());
+        }
+        // The committed value can change which rows match the filter and where
+        // they sort, so the view is rebuilt here, never per keystroke.
+        self.view.rebuild(&self.document.table);
+        self.selection = if session.column < self.column_count() {
+            self.view
+                .position_of(session.row)
+                .map(|position| Selection::Cell {
+                    position,
+                    column: session.column,
+                })
+                .unwrap_or(Selection::None)
+        } else {
+            Selection::None
+        };
+        self.notice = None;
+        self.save_error = None;
+        cx.notify();
+    }
+
+    /// Close the open session, putting the cell back the way it was.
+    fn cancel(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.session.take() else {
+            return;
+        };
+        self.edits
+            .discard_since(&mut self.document.table, session.opened_at);
+        self.view.rebuild(&self.document.table);
+        self.selection = if session.column < self.column_count() {
+            self.view
+                .position_of(session.row)
+                .map(|position| Selection::Cell {
+                    position,
+                    column: session.column,
+                })
+                .unwrap_or(Selection::None)
+        } else {
+            Selection::None
+        };
+        self.notice = None;
+        cx.notify();
+    }
+
+    /// Close the session and move the mark, the way committing with Enter, Tab,
+    /// Shift+Tab, or a vertical arrow does.
+    fn finish_and_move(&mut self, dx: isize, dy: isize, cx: &mut Context<Self>) {
+        if self.session.is_none() {
+            return;
+        }
+        self.commit(cx);
+        // A commit can hide the row behind the filter, and then there is no mark
+        // to move and no lie worth telling about where it went.
+        if matches!(self.selection, Selection::Cell { .. }) {
+            self.move_selection(dx, dy, cx);
+        }
+    }
+
+    /// Run one of the shared editor operations against the open cell.
+    fn edit_buffer(
+        &mut self,
+        cx: &mut Context<Self>,
+        change: impl FnOnce(&mut CellBuffer<'_>, &mut EditorState, &mut App),
+    ) -> bool {
+        let Some(session) = self.session.as_mut() else {
+            return false;
+        };
+        let (row, column) = (session.row, session.column);
+        let mut buffer = CellBuffer {
+            table: &mut self.document.table,
+            edits: &mut self.edits,
+            row,
+            column,
+        };
+        change(&mut buffer, &mut session.editor, cx);
+        self.after_keystroke(cx);
+        true
+    }
+
+    /// Redraw after a keystroke and clear the notice the last refusal left.
+    fn after_keystroke(&mut self, cx: &mut Context<Self>) {
+        self.notice = None;
+        cx.notify();
+    }
+
+    /// Refuse text a single-line cell cannot show faithfully.
+    ///
+    /// Stripping the characters instead would quietly write different bytes
+    /// than the user pasted, so the whole paste is refused and explained.
+    fn refuse_control(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
+        if !text.contains('\n') && !text.contains('\r') && !text.contains('\t') {
+            return false;
+        }
+        self.notice = Some(SharedString::from(
+            "a cell cannot hold a line break or a tab",
+        ));
+        cx.notify();
+        true
     }
 
     /// Whether the cell at this position and column is inside the mark.
@@ -270,6 +649,211 @@ impl CsvGrid {
         None
     }
 
+    // The editing actions below are only reachable while a session is open: the
+    // shared bindings live in the "TextEditor" context, which the grid joins for
+    // exactly as long as a cell is being edited.
+
+    fn act_backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
+        self.edit_buffer(cx, |buffer, editor, _| editor::backspace(buffer, editor));
+    }
+
+    fn act_delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
+        self.edit_buffer(cx, |buffer, editor, _| editor::delete(buffer, editor));
+    }
+
+    fn act_left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
+        // Navigation ends the undo group, so the next keystroke is its own step.
+        self.edits.break_group();
+        self.edit_buffer(cx, |buffer, editor, _| editor::left(buffer, editor, false));
+    }
+
+    fn act_right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
+        self.edits.break_group();
+        self.edit_buffer(cx, |buffer, editor, _| editor::right(buffer, editor, false));
+    }
+
+    fn act_select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.edits.break_group();
+        self.edit_buffer(cx, |buffer, editor, _| editor::left(buffer, editor, true));
+    }
+
+    fn act_select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.edits.break_group();
+        self.edit_buffer(cx, |buffer, editor, _| editor::right(buffer, editor, true));
+    }
+
+    fn act_word_left(&mut self, _: &WordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.edits.break_group();
+        self.edit_buffer(cx, |buffer, editor, _| {
+            editor::word_left(buffer, editor, false)
+        });
+    }
+
+    fn act_word_right(&mut self, _: &WordRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.edits.break_group();
+        self.edit_buffer(cx, |buffer, editor, _| {
+            editor::word_right(buffer, editor, false)
+        });
+    }
+
+    fn act_select_word_left(&mut self, _: &SelectWordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.edits.break_group();
+        self.edit_buffer(cx, |buffer, editor, _| {
+            editor::word_left(buffer, editor, true)
+        });
+    }
+
+    fn act_select_word_right(
+        &mut self,
+        _: &SelectWordRight,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.edits.break_group();
+        self.edit_buffer(cx, |buffer, editor, _| {
+            editor::word_right(buffer, editor, true)
+        });
+    }
+
+    fn act_home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
+        self.edits.break_group();
+        self.edit_buffer(cx, |buffer, editor, _| editor::home(buffer, editor, false));
+    }
+
+    fn act_end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
+        self.edits.break_group();
+        self.edit_buffer(cx, |buffer, editor, _| editor::end(buffer, editor, false));
+    }
+
+    fn act_select_home(&mut self, _: &SelectHome, _: &mut Window, cx: &mut Context<Self>) {
+        self.edits.break_group();
+        self.edit_buffer(cx, |buffer, editor, _| editor::home(buffer, editor, true));
+    }
+
+    fn act_select_end(&mut self, _: &SelectEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.edits.break_group();
+        self.edit_buffer(cx, |buffer, editor, _| editor::end(buffer, editor, true));
+    }
+
+    fn act_document_start(&mut self, _: &DocumentStart, _: &mut Window, cx: &mut Context<Self>) {
+        self.edits.break_group();
+        self.edit_buffer(cx, |_buffer, editor, _| {
+            editor::document_start(editor, false)
+        });
+    }
+
+    fn act_document_end(&mut self, _: &DocumentEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.edits.break_group();
+        self.edit_buffer(cx, |buffer, editor, _| {
+            editor::document_end(buffer, editor, false)
+        });
+    }
+
+    fn act_select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.edits.break_group();
+        self.edit_buffer(cx, |buffer, editor, _| editor::select_all(buffer, editor));
+    }
+
+    /// Copy selects the caret's selection, or the whole cell when there is none.
+    ///
+    /// An empty selection falling back to the value is the grid's own promise
+    /// ("Cmd+C copies the mark as text"), and while editing the mark is this
+    /// cell, so the two rules cannot disagree.
+    fn act_copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        let Some((row, column)) = self.session_cell() else {
+            return;
+        };
+        let value = self.cell_text(row, column).to_string();
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        let copied = if session.editor.has_selection() {
+            let range = clamp_range(&value, session.editor.selection());
+            value[range].to_string()
+        } else {
+            value
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(copied));
+    }
+
+    fn act_cut(&mut self, _: &Cut, _: &mut Window, cx: &mut Context<Self>) {
+        self.edit_buffer(cx, |buffer, editor, cx| editor::cut(buffer, editor, cx));
+    }
+
+    fn act_paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return;
+        };
+        if self.refuse_control(&text, cx) {
+            return;
+        }
+        self.edit_buffer(cx, |buffer, editor, _| {
+            editor::insert(buffer, editor, &text);
+        });
+    }
+
+    fn act_undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        let Some((row, column)) = self.session_cell() else {
+            return;
+        };
+        // Undo inside a session stops at the step it opened on: undoing past it
+        // is work the user cannot see behind the caret.
+        let opened_at = self.session.as_ref().and_then(|session| session.opened_at);
+        if opened_at == self.edits.head() {
+            return;
+        }
+        let Some(outcome) = self.edits.undo_cell(&mut self.document.table, row, column) else {
+            return;
+        };
+        let caret = outcome
+            .caret
+            .unwrap_or(0)
+            .min(self.cell_text(row, column).len());
+        if let Some(session) = self.session.as_mut() {
+            session.editor.marked = None;
+            session.editor.move_to(caret);
+        }
+        self.after_keystroke(cx);
+    }
+
+    fn act_redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        let Some((row, column)) = self.session_cell() else {
+            return;
+        };
+        let Some(outcome) = self.edits.redo_cell(&mut self.document.table, row, column) else {
+            return;
+        };
+        let caret = outcome
+            .caret
+            .unwrap_or(0)
+            .min(self.cell_text(row, column).len());
+        if let Some(session) = self.session.as_mut() {
+            session.editor.marked = None;
+            session.editor.move_to(caret);
+        }
+        self.after_keystroke(cx);
+    }
+
+    fn act_enter(&mut self, _: &Enter, _: &mut Window, cx: &mut Context<Self>) {
+        self.finish_and_move(0, 1, cx);
+    }
+
+    fn act_tab(&mut self, _: &Tab, _: &mut Window, cx: &mut Context<Self>) {
+        self.finish_and_move(1, 0, cx);
+    }
+
+    fn act_outdent(&mut self, _: &Outdent, _: &mut Window, cx: &mut Context<Self>) {
+        self.finish_and_move(-1, 0, cx);
+    }
+
+    fn act_up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
+        self.finish_and_move(0, -1, cx);
+    }
+
+    fn act_down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
+        self.finish_and_move(0, 1, cx);
+    }
+
     /// Move the mark one cell, turning any other kind of mark into a cell.
     fn move_selection(&mut self, dx: isize, dy: isize, cx: &mut Context<Self>) {
         let rows = self.view.len();
@@ -330,8 +914,11 @@ impl CsvGrid {
     ///
     /// This is the tab's save entry point, called by the workspace's `Save`
     /// action. The grid no longer listens for Cmd+S itself: actions run before
-    /// key listeners, so one global binding is the honest place for it.
+    /// key listeners, so one global binding is the honest place for it. An open
+    /// cell is committed first, because a save has to write what is on screen.
     pub fn save(&mut self, cx: &mut Context<Self>) {
+        self.commit(cx);
+
         if self.document.lossy {
             self.save_error = Some(SharedString::from(
                 "not saved: this file is not valid UTF-8, so writing it back would lose data",
@@ -342,7 +929,7 @@ impl CsvGrid {
 
         match self.document.save(&self.path) {
             Ok(()) => {
-                self.dirty = false;
+                self.saved_head = self.edits.head();
                 self.save_error = None;
             }
             Err(error) => self.save_error = Some(SharedString::from(error.to_string())),
@@ -353,6 +940,8 @@ impl CsvGrid {
 
     /// Insert an empty row below the marked one, or at the end of the file.
     fn insert_row(&mut self, cx: &mut Context<Self>) {
+        self.commit(cx);
+
         let at = match self.selection {
             Selection::Cell { position, .. } | Selection::Row { position } => self
                 .view
@@ -361,12 +950,14 @@ impl CsvGrid {
             _ => self.total_row_count(),
         };
 
-        self.document.table.insert_row(at);
+        self.edits.insert_row(&mut self.document.table, at);
         self.after_table_change(cx);
     }
 
     /// Remove the marked row, if one is marked.
     fn delete_row(&mut self, cx: &mut Context<Self>) {
+        self.commit(cx);
+
         let position = match self.selection {
             Selection::Cell { position, .. } | Selection::Row { position } => position,
             _ => return,
@@ -375,52 +966,111 @@ impl CsvGrid {
             return;
         };
 
-        if self.document.table.remove_row(row).is_ok() {
+        if self.edits.remove_row(&mut self.document.table, row).is_ok() {
             self.after_table_change(cx);
         }
     }
 
     /// Insert an empty column right of the marked one, or at the right edge.
     fn insert_column(&mut self, cx: &mut Context<Self>) {
+        self.commit(cx);
+
         let index = match self.selection {
             Selection::Cell { column, .. } | Selection::Column { column } => column + 1,
             _ => self.column_count(),
         };
 
-        self.document
-            .table
-            .insert_column(index, format!("column {}", index + 1));
+        self.edits.insert_column(
+            &mut self.document.table,
+            index,
+            format!("column {}", index + 1),
+        );
         self.after_table_change(cx);
     }
 
     /// Remove the marked column, if one is marked.
     fn delete_column(&mut self, cx: &mut Context<Self>) {
+        self.commit(cx);
+
         let column = match self.selection {
             Selection::Cell { column, .. } | Selection::Column { column } => column,
             _ => return,
         };
 
-        if self.document.table.remove_column(column).is_ok() {
+        if self
+            .edits
+            .remove_column(&mut self.document.table, column)
+            .is_ok()
+        {
             self.after_table_change(cx);
         }
     }
 
-    /// Rebuild everything an edit has to keep in step.
+    /// Rebuild everything a structural edit has to keep in step.
     ///
     /// Widths are measured again because a new column has none and a removed one
     /// must not leave its width behind. The mark is dropped because positions
     /// and column indices no longer mean what they meant before the edit.
+    /// Dirtiness is not touched here: it is derived from the history head, so an
+    /// undo back to the saved state says "saved" again.
     fn after_table_change(&mut self, cx: &mut Context<Self>) {
         self.view.rebuild(&self.document.table);
         self.column_widths = measure_columns(&self.document, cx.text_system());
         self.selection = Selection::None;
-        self.dirty = true;
+        self.notice = None;
         self.save_error = None;
         cx.notify();
     }
 
+    /// Undo the last edit, cell or structural.
+    fn undo(&mut self, cx: &mut Context<Self>) {
+        let Some(outcome) = self.edits.undo(&mut self.document.table) else {
+            return;
+        };
+        self.after_history_move(outcome, cx);
+    }
+
+    fn redo(&mut self, cx: &mut Context<Self>) {
+        let Some(outcome) = self.edits.redo(&mut self.document.table) else {
+            return;
+        };
+        self.after_history_move(outcome, cx);
+    }
+
+    /// Put the mark on whatever an undo or redo restored.
+    fn after_history_move(&mut self, outcome: EditOutcome, cx: &mut Context<Self>) {
+        self.view.rebuild(&self.document.table);
+        self.column_widths = measure_columns(&self.document, cx.text_system());
+        self.selection = self.mark_for(outcome);
+        self.notice = None;
+        self.save_error = None;
+        cx.notify();
+    }
+
+    /// The mark that names the row or column a step restored, if it still shows.
+    ///
+    /// A row the filter hides has no position, and pretending otherwise would
+    /// put the mark on whichever row happened to move into its place.
+    fn mark_for(&self, outcome: EditOutcome) -> Selection {
+        match (outcome.row, outcome.column) {
+            (Some(row), Some(column)) if column < self.column_count() => self
+                .view
+                .position_of(row)
+                .map(|position| Selection::Cell { position, column })
+                .unwrap_or(Selection::None),
+            (Some(row), None) => self
+                .view
+                .position_of(row)
+                .map(|position| Selection::Row { position })
+                .unwrap_or(Selection::None),
+            (None, Some(column)) if column < self.column_count() => Selection::Column { column },
+            _ => Selection::None,
+        }
+    }
+
     /// Sort by `column`, or reverse the sort if it is already sorted by it.
     fn toggle_sort(&mut self, column: usize, cx: &mut Context<Self>) {
+        self.commit(cx);
         self.view.toggle_sort(&self.document.table, column);
         // Sorting moves rows, so a mark on a position would point at a different
         // row than it did before the click.
@@ -429,6 +1079,7 @@ impl CsvGrid {
     }
 
     fn set_query(&mut self, query: String, cx: &mut Context<Self>) {
+        self.commit(cx);
         self.view.set_query(&self.document.table, query);
         // Filtering hides rows, so a marked position may no longer exist.
         self.selection = Selection::None;
@@ -448,23 +1099,40 @@ impl CsvGrid {
     }
 
     fn clear_query(&mut self, cx: &mut Context<Self>) {
+        self.commit(cx);
         self.view.clear_query(&self.document.table);
         cx.notify();
     }
 
-    /// Search is driven by raw keystrokes rather than a text field.
+    /// The unbound keys: search while nothing is being edited, and the session's
+    /// own cancel while something is.
     ///
-    /// A real field needs `EntityInputHandler` plus `window.handle_input` during
-    /// paint, which is a larger piece of work than this increment. Typing
-    /// characters, backspace, and escape cover searching, and nothing here
-    /// claims to be a caret.
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    /// Every key a cell editor needs is a `TextEditor` binding, and actions run
+    /// before key listeners, so almost nothing reaches here with a session open.
+    /// Escape is the exception, because nothing binds it.
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
 
-        // The editing keys go first, and never into the search box.
+        // An open cell owns the keyboard. Returning here is not tidiness: the
+        // last arm below appends any character to the search query, and the
+        // platform input handler delivers the same character to the cell, so a
+        // keystroke that fell through would be typed twice.
+        if self.session.is_some() {
+            if key == "escape" && !event.keystroke.modifiers.platform {
+                self.cancel(cx);
+            }
+            return;
+        }
+
+        // The grid's own shortcuts, plus undo and redo. Cmd+Z is bound only in
+        // the editor context, so structural undo is reached from here when no
+        // cell is open.
         if event.keystroke.modifiers.platform {
-            if key == "c" {
-                self.copy_selection(cx);
+            match key {
+                "c" => self.copy_selection(cx),
+                "z" if event.keystroke.modifiers.shift => self.redo(cx),
+                "z" => self.undo(cx),
+                _ => {}
             }
             return;
         }
@@ -480,6 +1148,11 @@ impl CsvGrid {
                 self.selection = Selection::None;
                 self.clear_query(cx);
             }
+            "enter" => {
+                if let Selection::Cell { position, column } = self.selection {
+                    self.start_editing(position, column, None, window, cx);
+                }
+            }
             "up" => self.move_selection(0, -1, cx),
             "down" => self.move_selection(0, 1, cx),
             "left" => self.move_selection(-1, 0, cx),
@@ -492,6 +1165,16 @@ impl CsvGrid {
                 }
             }
         }
+    }
+
+    /// The coordinate of the cell being edited, e.g. `D7`.
+    ///
+    /// `None` when no session is open or its row is hidden by the filter, in
+    /// which case there is no coordinate an honest strip could show.
+    fn editing_cell_label(&self) -> Option<String> {
+        let session = self.session.as_ref()?;
+        let position = self.view.position_of(session.row)?;
+        Some(format!("{}{}", column_label(session.column), position + 1))
     }
 
     /// Anything the user should know about how the file was read.
@@ -533,6 +1216,7 @@ impl CsvGrid {
     fn status_bar(&self, cx: &Context<Self>) -> Div {
         let total = self.total_row_count();
         let columns = self.column_count();
+        let dirty = self.is_dirty();
         let counts = if self.view.len() == total {
             format!("{total} rows, {columns} columns")
         } else {
@@ -555,7 +1239,22 @@ impl CsvGrid {
                     .text_xs()
                     .text_color(theme::text_muted())
                     .child(SharedString::from(counts)),
-            )
+            );
+
+        // While a cell is open the value being edited tells the reader nothing
+        // about where they are, so the strip names the cell the way a
+        // spreadsheet's name box does.
+        if let Some(cell) = self.editing_cell_label() {
+            bar = bar.child(
+                div()
+                    .debug_selector(|| "editing-cell".to_string())
+                    .text_xs()
+                    .text_color(theme::text_muted())
+                    .child(SharedString::from(cell)),
+            );
+        }
+
+        let mut bar = bar
             // The counts stay left and the state stays right however wide the
             // window is.
             .child(div().flex_1())
@@ -573,6 +1272,10 @@ impl CsvGrid {
             );
         }
 
+        if let Some(notice) = self.notice.clone() {
+            bar = bar.child(div().text_xs().text_color(theme::warning()).child(notice));
+        }
+
         if let Some(error) = self.save_error.clone() {
             bar = bar.child(div().text_xs().text_color(theme::warning()).child(error));
         }
@@ -580,12 +1283,12 @@ impl CsvGrid {
         bar.child(
             div()
                 .text_xs()
-                .text_color(if self.dirty {
+                .text_color(if dirty {
                     theme::warning()
                 } else {
                     theme::text_muted()
                 })
-                .child(SharedString::from(if self.dirty {
+                .child(SharedString::from(if dirty {
                     "unsaved changes"
                 } else {
                     "saved"
@@ -1158,6 +1861,22 @@ impl CsvGrid {
                 .unwrap_or_default()
                 .to_string();
 
+            let session = self
+                .session
+                .as_ref()
+                .filter(|session| Some(session.row) == row && session.column == column);
+
+            let content = match session {
+                Some(session) => self.editing_cell(column, session, cx),
+                None => div()
+                    .w_full()
+                    .min_w(px(0.0))
+                    .font_family(theme::monospace())
+                    .text_size(px(CELL_FONT_SIZE))
+                    .truncate()
+                    .child(text),
+            };
+
             cells.push(
                 div()
                     .w(px(*width))
@@ -1174,15 +1893,7 @@ impl CsvGrid {
                     .when(self.cell_is_focused(position, column), |el| {
                         el.bg(theme::selection_strong())
                     })
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w(px(0.0))
-                            .font_family(theme::monospace())
-                            .text_size(px(CELL_FONT_SIZE))
-                            .truncate()
-                            .child(text),
-                    ),
+                    .child(content),
             );
         }
 
@@ -1202,16 +1913,224 @@ impl CsvGrid {
             .h(px(ROW_HEIGHT))
             .when(position % 2 == 1, |el| el.bg(theme::row_alternate()))
             // One listener per row rather than one per cell: a cell is a plain
-            // div, and marking a cell only needs the column the click fell in.
+            // div, so marking a cell and placing a caret both only need the
+            // column the pointer fell in.
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                     this.focus(window);
-                    this.select_cell_at(position, event.position.x, cx);
+                    this.click_cell(position, row, event, window, cx);
+                }),
+            )
+            .on_mouse_move(
+                cx.listener(move |this, event: &MouseMoveEvent, _window, cx| {
+                    this.drag_caret(row, event, cx);
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _event: &MouseUpEvent, _window, _cx| {
+                    if let Some(session) = this.session.as_mut() {
+                        session.editor.dragging = false;
+                    }
                 }),
             )
             .children(cells)
     }
+
+    /// Handle a left click on the row at `position`.
+    ///
+    /// A click inside the open cell places the caret. A click anywhere else
+    /// commits first, so nothing downstream has to reason about a half-open
+    /// edit, and a double click starts one.
+    fn click_cell(
+        &mut self,
+        position: usize,
+        row: Option<usize>,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(column) = self.column_at(event.position.x) else {
+            return;
+        };
+
+        if let Some(session) = self.session.as_ref() {
+            if Some(session.row) == row && session.column == column {
+                if event.click_count < 2 {
+                    self.place_caret(column, event.position.x, event.modifiers.shift, true, cx);
+                }
+                return;
+            }
+            self.commit(cx);
+        }
+
+        // Committing can move the row under a sort or hide it behind the
+        // filter, so the position is looked up again before it is used.
+        let position = row
+            .and_then(|row| self.view.position_of(row))
+            .unwrap_or(position);
+
+        if event.click_count == 2 {
+            self.start_editing(position, column, Some(event.position.x), window, cx);
+        } else {
+            self.select_cell_at(position, event.position.x, cx);
+        }
+    }
+
+    /// Put the caret at the window x `x` inside the open cell.
+    fn place_caret(
+        &mut self,
+        column: usize,
+        x: Pixels,
+        extend: bool,
+        start_drag: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        if session.column != column {
+            return;
+        }
+        let text = self.cell_text(session.row, column).to_string();
+        let metrics = CellMetrics::new(cx.text_system());
+        let offset = metrics.offset_for_x(&text, f32::from(x) - self.cell_screen_left(column));
+
+        self.edits.break_group();
+        if let Some(session) = self.session.as_mut() {
+            if extend {
+                session.editor.select_to(offset);
+            } else {
+                session.editor.move_to(offset);
+            }
+            if start_drag {
+                session.editor.dragging = true;
+            }
+        }
+        cx.notify();
+    }
+
+    /// Extend the cell's selection while a drag that began inside it continues.
+    ///
+    /// A pointer dragged past the value's edges clamps to its ends: there is no
+    /// autoscroll inside a cell, and selecting something off screen that the
+    /// user cannot see would be worse than stopping.
+    fn drag_caret(&mut self, row: Option<usize>, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        if !session.editor.dragging || !event.dragging() || Some(session.row) != row {
+            return;
+        }
+        let column = session.column;
+        self.place_caret(column, event.position.x, true, false, cx);
+    }
+
+    /// The cell being edited: the value with its selection wash and a steady
+    /// caret, scrolled sideways so the caret stays inside the cell.
+    fn editing_cell(&self, column: usize, session: &CellSession, cx: &Context<Self>) -> Div {
+        let text = self.cell_text(session.row, column).to_string();
+        let metrics = CellMetrics::new(cx.text_system());
+        let caret = clamp_boundary(&text, session.editor.caret);
+        let caret_x = metrics.prefix_width(&text[..caret]);
+        let width = self
+            .column_widths
+            .get(column)
+            .copied()
+            .unwrap_or(MIN_COLUMN_WIDTH);
+        let usable = (width - 2.0 * CELL_PADDING_X).max(1.0);
+        // Keep the caret one character inside the cell, so typing at the end of
+        // a long value scrolls the text rather than hiding the caret.
+        let advance = metrics.advance('M').max(1.0);
+        let offset = (caret_x + advance - usable).max(0.0);
+
+        let selection = clamp_range(&text, session.editor.selection());
+        let marked = session
+            .editor
+            .marked
+            .as_ref()
+            .map(|range| clamp_range(&text, range.clone()));
+        let runs = text_runs(&text, selection, marked);
+
+        div()
+            .relative()
+            .w_full()
+            .min_w(px(0.0))
+            .h(px(ROW_HEIGHT))
+            .overflow_hidden()
+            .font_family(theme::monospace())
+            .text_size(px(CELL_FONT_SIZE))
+            .child(
+                div()
+                    .absolute()
+                    .top(px(0.0))
+                    .left(px(-offset))
+                    .h(px(ROW_HEIGHT))
+                    .flex()
+                    .items_center()
+                    .child(StyledText::new(text).with_runs(runs)),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "cell-caret".to_string())
+                    .absolute()
+                    .top(px(3.0))
+                    .left(px(caret_x - offset))
+                    .w(px(1.0))
+                    .h(px(ROW_HEIGHT - 8.0))
+                    .bg(theme::accent()),
+            )
+            // The platform input handler needs an element to paint, and its
+            // bounds are what place the IME candidate window beside the text.
+            .child(div().absolute().top(px(0.0)).left(px(0.0)).w_full().child(
+                editor::InputBridgeElement::new(cx.entity(), self.focus_handle.clone()),
+            ))
+    }
+}
+
+/// Split `text` into runs so the selection is washed and a composition is
+/// underlined, without changing the bytes.
+///
+/// `StyledText` asserts that the runs cover the text exactly, so the boundaries
+/// of the selection and the composition are the only places a run may start.
+fn text_runs(text: &str, selection: Range<usize>, marked: Option<Range<usize>>) -> Vec<TextRun> {
+    let mut boundaries = vec![0, text.len(), selection.start, selection.end];
+    if let Some(marked) = &marked {
+        boundaries.push(marked.start);
+        boundaries.push(marked.end);
+    }
+    boundaries.retain(|edge| *edge <= text.len());
+    boundaries.sort_unstable();
+    boundaries.dedup();
+
+    let font = font(theme::monospace());
+    boundaries
+        .windows(2)
+        .filter_map(|pair| {
+            let (start, end) = (pair[0], pair[1]);
+            if start == end {
+                return None;
+            }
+            let selected =
+                !selection.is_empty() && start >= selection.start && end <= selection.end;
+            let composing = marked
+                .as_ref()
+                .is_some_and(|marked| start >= marked.start && end <= marked.end);
+            Some(TextRun {
+                len: end - start,
+                font: font.clone(),
+                color: theme::text(),
+                background_color: selected.then(theme::selection),
+                underline: composing.then(|| gpui::UnderlineStyle {
+                    thickness: px(1.0),
+                    color: Some(theme::accent()),
+                    wavy: false,
+                }),
+                strikethrough: None,
+            })
+        })
+        .collect()
 }
 
 impl Render for CsvGrid {
@@ -1224,7 +2143,38 @@ impl Render for CsvGrid {
             .bg(theme::background())
             .text_color(theme::text())
             .text_sm()
+            // The shared bindings only match while a cell is open. Outside a
+            // session the grid stays out of the context, which is what keeps
+            // Cmd+C for its own mark and typing for the search box.
+            .when(self.session.is_some(), |el| el.key_context("TextEditor"))
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(Self::act_left))
+            .on_action(cx.listener(Self::act_right))
+            .on_action(cx.listener(Self::act_up))
+            .on_action(cx.listener(Self::act_down))
+            .on_action(cx.listener(Self::act_home))
+            .on_action(cx.listener(Self::act_end))
+            .on_action(cx.listener(Self::act_document_start))
+            .on_action(cx.listener(Self::act_document_end))
+            .on_action(cx.listener(Self::act_word_left))
+            .on_action(cx.listener(Self::act_word_right))
+            .on_action(cx.listener(Self::act_select_left))
+            .on_action(cx.listener(Self::act_select_right))
+            .on_action(cx.listener(Self::act_select_home))
+            .on_action(cx.listener(Self::act_select_end))
+            .on_action(cx.listener(Self::act_select_word_left))
+            .on_action(cx.listener(Self::act_select_word_right))
+            .on_action(cx.listener(Self::act_select_all))
+            .on_action(cx.listener(Self::act_backspace))
+            .on_action(cx.listener(Self::act_delete))
+            .on_action(cx.listener(Self::act_enter))
+            .on_action(cx.listener(Self::act_tab))
+            .on_action(cx.listener(Self::act_outdent))
+            .on_action(cx.listener(Self::act_copy))
+            .on_action(cx.listener(Self::act_cut))
+            .on_action(cx.listener(Self::act_paste))
+            .on_action(cx.listener(Self::act_undo))
+            .on_action(cx.listener(Self::act_redo))
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(
                 MouseButton::Left,
@@ -1236,6 +2186,183 @@ impl Render for CsvGrid {
     }
 }
 
+/// The platform input handler for the open cell.
+///
+/// GPUI has no text-field widget, so the grid becomes one for as long as a
+/// session is open: the bridge element inside the edited cell registers this
+/// during paint, which is what makes IME, the character palette, and paste work.
+/// The bytes belong to the cell in the table, and every replacement goes through
+/// the same history the renderer reads.
+impl EntityInputHandler for CsvGrid {
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        actual_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let (row, column) = self.session_cell()?;
+        let text = self.cell_text(row, column);
+        let range = clamp_range(text, editor::range_from_utf16(text, &range_utf16));
+        actual_range.replace(editor::range_to_utf16(text, &range));
+        Some(text[range].to_string())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let session = self.session.as_ref()?;
+        let text = self.cell_text(session.row, session.column);
+        Some(editor::utf16_selection(text, &session.editor))
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        let session = self.session.as_ref()?;
+        let text = self.cell_text(session.row, session.column);
+        session
+            .editor
+            .marked
+            .as_ref()
+            .map(|range| editor::range_to_utf16(text, range))
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        if let Some(session) = self.session.as_mut() {
+            session.editor.marked = None;
+        }
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.refuse_control(text, cx) {
+            return;
+        }
+        let Some((row, column)) = self.session_cell() else {
+            return;
+        };
+        let range = {
+            let Some(session) = self.session.as_ref() else {
+                return;
+            };
+            let value = self.cell_text(row, column).to_string();
+            let caret_before = session.editor.caret;
+            let range = range_utf16
+                .as_ref()
+                .map(|range| editor::range_from_utf16(&value, range))
+                .or_else(|| session.editor.marked.clone())
+                .unwrap_or_else(|| session.editor.selection());
+            (clamp_range(&value, range), caret_before)
+        };
+
+        let mut buffer = CellBuffer {
+            table: &mut self.document.table,
+            edits: &mut self.edits,
+            row,
+            column,
+        };
+        let caret = buffer.buffer_replace(range.0, text, range.1, 0, EditKind::Typing);
+        if let Some(session) = self.session.as_mut() {
+            session.editor.marked = None;
+            session.editor.move_to(caret);
+        }
+        self.after_keystroke(cx);
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.refuse_control(new_text, cx) {
+            return;
+        }
+        let Some((row, column)) = self.session_cell() else {
+            return;
+        };
+        let (range, caret_before) = {
+            let Some(session) = self.session.as_ref() else {
+                return;
+            };
+            let value = self.cell_text(row, column).to_string();
+            let range = range_utf16
+                .as_ref()
+                .map(|range| editor::range_from_utf16(&value, range))
+                .or_else(|| session.editor.marked.clone())
+                .unwrap_or_else(|| session.editor.selection());
+            (clamp_range(&value, range), session.editor.caret)
+        };
+        let start = range.start;
+
+        let mut buffer = CellBuffer {
+            table: &mut self.document.table,
+            edits: &mut self.edits,
+            row,
+            column,
+        };
+        let caret = buffer.buffer_replace(range, new_text, caret_before, 0, EditKind::Typing);
+        if let Some(session) = self.session.as_mut() {
+            session.editor.marked = if new_text.is_empty() {
+                None
+            } else {
+                Some(start..start + new_text.len())
+            };
+            session.editor.move_to(caret);
+            if let Some(selected) = new_selected_range {
+                let selected = editor::range_from_utf16(new_text, &selected);
+                session.editor.select_to(start + selected.end);
+            }
+        }
+        self.after_keystroke(cx);
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        let (row, column) = self.session_cell()?;
+        let text = self.cell_text(row, column);
+        let offset = clamp_boundary(text, editor::offset_from_utf16(text, range_utf16.start));
+        let metrics = CellMetrics::new(cx.text_system());
+        let x = element_bounds.origin.x + px(metrics.prefix_width(&text[..offset]));
+        Some(Bounds::new(
+            point(x, element_bounds.origin.y),
+            gpui::size(px(2.0), px(ROW_HEIGHT - 8.0)),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        position: Point<Pixels>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let (row, column) = self.session_cell()?;
+        let text = self.cell_text(row, column);
+        let metrics = CellMetrics::new(cx.text_system());
+        let offset =
+            metrics.offset_for_x(text, f32::from(position.x) - self.cell_screen_left(column));
+        Some(editor::offset_to_utf16(text, offset))
+    }
+}
+
 /// Width for every column, measured from the widest value it has to show.
 ///
 /// The file is scanned once at load, comparing lengths only. The single widest
@@ -1244,34 +2371,34 @@ impl Render for CsvGrid {
 /// every frame.
 fn measure_columns(document: &CsvDocument, text_system: &TextSystem) -> Vec<f32> {
     let table = &document.table;
-    let columns = table.column_count();
+    (0..table.column_count())
+        .map(|column| measure_column(table, column, text_system))
+        .collect()
+}
 
+/// Width for one column, measured from the widest value it has to show.
+///
+/// A committed cell re-measures only its own column, which is why this exists
+/// apart from [`measure_columns`]: growing one column must not cost a scan of
+/// every other one on every commit.
+fn measure_column(table: &Table, column: usize, text_system: &TextSystem) -> f32 {
     // Seed with the header, so a column is always wide enough for its own name.
-    let mut widest_chars = Vec::with_capacity(columns);
-    let mut widest: Vec<&str> = Vec::with_capacity(columns);
-    for column in 0..columns {
-        let header = table.header(column).unwrap_or_default();
-        widest_chars.push(header.chars().count());
-        widest.push(header);
-    }
+    let header = table.header(column).unwrap_or_default();
+    let mut widest = (header.chars().count(), header);
 
     for row in table.rows() {
-        for column in 0..columns.min(row.len()) {
-            let cell = row[column].as_str();
-            let chars = cell.chars().count();
-            if chars > widest_chars[column] {
-                widest_chars[column] = chars;
-                widest[column] = cell;
-            }
+        let Some(cell) = row.get(column).map(String::as_str) else {
+            continue;
+        };
+        let chars = cell.chars().count();
+        if chars > widest.0 {
+            widest = (chars, cell);
         }
     }
 
     let font = font(theme::monospace());
     let font_size = px(CELL_FONT_SIZE);
-    widest
-        .into_iter()
-        .map(|text| column_width(text_width(text, text_system, &font, font_size)))
-        .collect()
+    column_width(text_width(widest.1, text_system, &font, font_size))
 }
 
 /// The width `text` occupies when drawn in the grid's font, in pixels.
@@ -2021,7 +3148,7 @@ mod tests {
 
         click(cx, "edit-insert-row");
         assert_eq!(visible_rows(cx, &grid), 4);
-        assert!(cx.update(|_window, app| grid.read(app).dirty));
+        assert!(cx.update(|_window, app| grid.read(app).is_dirty()));
         draw(cx);
 
         click(cx, "row-number-0");
@@ -2053,11 +3180,11 @@ mod tests {
 
         click(cx, "edit-insert-row");
         assert_eq!(visible_rows(cx, &grid), 2);
-        assert!(cx.update(|_window, app| grid.read(app).dirty));
+        assert!(cx.update(|_window, app| grid.read(app).is_dirty()));
 
         cx.update(|_window, app| grid.update(app, |grid, cx| grid.save(cx)));
 
-        assert!(!cx.update(|_window, app| grid.read(app).dirty));
+        assert!(!cx.update(|_window, app| grid.read(app).is_dirty()));
         let reloaded = load_csv(&path).expect("the saved file still loads");
         assert_eq!(reloaded.table.row_count(), 2);
         assert_eq!(reloaded.table.get(0, 1), Some("412"));
@@ -2136,5 +3263,531 @@ mod tests {
             row.origin.x - px(240.0),
             "the cells should have panned while the numbers held still"
         );
+    }
+
+    // --- cell editing ---
+
+    /// Bind the shared editing keys, the way the binary does at launch.
+    ///
+    /// Without these bindings a keystroke would reach the grid's own listener and
+    /// be typed into the search box, which is the failure these tests exist to
+    /// catch rather than repeat.
+    fn bind_editing_keys(cx: &mut VisualTestContext) {
+        cx.update(|_window, app| crate::text_actions::bind_text_editor_keys(app));
+    }
+
+    /// The x offset from a row's left edge where a column's text begins.
+    fn cell_x(cx: &mut VisualTestContext, grid: &Entity<CsvGrid>, column: usize) -> f32 {
+        cx.update(|_window, app| {
+            let grid = grid.read(app);
+            grid.column_widths.iter().take(column).sum::<f32>() + CELL_PADDING_X + 2.0
+        })
+    }
+
+    /// Double click inside a row, `dx` from its left edge.
+    ///
+    /// `simulate_mouse_down` hardcodes a click count of one, so the pair is
+    /// dispatched by hand.
+    fn double_click_at(cx: &mut VisualTestContext, selector: &'static str, dx: f32) {
+        let bounds = cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} was not laid out"));
+        let position = point(bounds.origin.x + px(dx), bounds.center().y);
+        for click_count in [1, 2] {
+            cx.simulate_event(MouseDownEvent {
+                position,
+                modifiers: Modifiers::none(),
+                button: MouseButton::Left,
+                click_count,
+                first_mouse: false,
+            });
+            cx.simulate_event(MouseUpEvent {
+                position,
+                modifiers: Modifiers::none(),
+                button: MouseButton::Left,
+                click_count,
+            });
+        }
+    }
+
+    /// Open an edit on a cell with the caret at the end of its value.
+    ///
+    /// Every test that types wants to append, and where a double click puts the
+    /// caret on its own is `double_clicking_a_cell_opens_an_edit…`'s job.
+    fn edit_cell(cx: &mut VisualTestContext, grid: &Entity<CsvGrid>, row: usize, column: usize) {
+        draw(cx);
+        let x = cell_x(cx, grid, column);
+        let selector: &'static str = match row {
+            0 => "row-0",
+            1 => "row-1",
+            2 => "row-2",
+            _ => panic!("the tests only edit rows 0 to 2"),
+        };
+        double_click_at(cx, selector, x);
+        draw(cx);
+        cx.simulate_keystrokes("end");
+    }
+
+    fn cell(
+        cx: &mut VisualTestContext,
+        grid: &Entity<CsvGrid>,
+        position: usize,
+        column: usize,
+    ) -> String {
+        cx.update(|_window, app| {
+            grid.read(app)
+                .cell_at(position, column)
+                .unwrap_or_default()
+                .to_string()
+        })
+    }
+
+    fn caret(cx: &mut VisualTestContext, grid: &Entity<CsvGrid>) -> Option<usize> {
+        cx.update(|_window, app| {
+            grid.read(app)
+                .session
+                .as_ref()
+                .map(|session| session.editor.caret)
+        })
+    }
+
+    fn editing(cx: &mut VisualTestContext, grid: &Entity<CsvGrid>) -> bool {
+        cx.update(|_window, app| grid.read(app).is_editing())
+    }
+
+    #[gpui::test]
+    fn double_clicking_a_cell_opens_an_edit_with_the_caret_under_the_pointer(
+        cx: &mut TestAppContext,
+    ) {
+        let (grid, cx) = grid(cx);
+        bind_editing_keys(cx);
+        focus(cx, &grid);
+
+        draw(cx);
+        let x = cell_x(cx, &grid, 1);
+        double_click_at(cx, "row-0", x);
+        draw(cx);
+
+        assert!(editing(cx, &grid));
+        assert_eq!(
+            caret(cx, &grid),
+            Some(0),
+            "the click was at the value's start"
+        );
+    }
+
+    #[gpui::test]
+    fn enter_on_a_marked_cell_opens_an_edit_with_the_caret_at_the_end(cx: &mut TestAppContext) {
+        let (grid, cx) = grid(cx);
+        bind_editing_keys(cx);
+        focus(cx, &grid);
+
+        click_at(cx, "row-0", 10.0);
+        cx.simulate_keystrokes("enter");
+        draw(cx);
+
+        assert!(editing(cx, &grid));
+        assert_eq!(caret(cx, &grid), Some(3), "the caret appends to \"ada\"");
+    }
+
+    #[gpui::test]
+    fn typing_into_an_open_cell_changes_that_cell_and_leaves_the_query_alone(
+        cx: &mut TestAppContext,
+    ) {
+        let (grid, cx) = grid(cx);
+        bind_editing_keys(cx);
+        focus(cx, &grid);
+
+        edit_cell(cx, &grid, 0, 1);
+        cx.simulate_input("x");
+
+        assert_eq!(cell(cx, &grid, 0, 1), "412x");
+        assert_eq!(
+            cx.update(|_window, app| grid.read(app).query().to_string()),
+            ""
+        );
+        assert_eq!(
+            visible_rows(cx, &grid),
+            3,
+            "typing in a cell must not filter the table"
+        );
+    }
+
+    #[gpui::test]
+    fn backspace_edits_the_cell_rather_than_the_query(cx: &mut TestAppContext) {
+        let (grid, cx) = grid(cx);
+        bind_editing_keys(cx);
+        focus(cx, &grid);
+
+        edit_cell(cx, &grid, 0, 1);
+        cx.simulate_keystrokes("backspace");
+
+        assert_eq!(cell(cx, &grid, 0, 1), "41");
+        assert_eq!(
+            cx.update(|_window, app| grid.read(app).query().to_string()),
+            ""
+        );
+    }
+
+    #[gpui::test]
+    fn enter_commits_and_marks_the_cell_one_row_down(cx: &mut TestAppContext) {
+        let (grid, cx) = grid(cx);
+        bind_editing_keys(cx);
+        focus(cx, &grid);
+
+        edit_cell(cx, &grid, 0, 0);
+        cx.simulate_input("!");
+        cx.simulate_keystrokes("enter");
+
+        assert!(!editing(cx, &grid));
+        assert_eq!(cell(cx, &grid, 0, 0), "ada!");
+        assert_eq!(
+            mark(cx, &grid),
+            Selection::Cell {
+                position: 1,
+                column: 0
+            }
+        );
+    }
+
+    #[gpui::test]
+    fn tab_commits_and_marks_the_next_column(cx: &mut TestAppContext) {
+        let (grid, cx) = grid(cx);
+        bind_editing_keys(cx);
+        focus(cx, &grid);
+
+        edit_cell(cx, &grid, 0, 0);
+        cx.simulate_input("!");
+        cx.simulate_keystrokes("tab");
+
+        assert!(!editing(cx, &grid));
+        assert_eq!(cell(cx, &grid, 0, 0), "ada!");
+        assert_eq!(
+            mark(cx, &grid),
+            Selection::Cell {
+                position: 0,
+                column: 1
+            }
+        );
+    }
+
+    #[gpui::test]
+    fn escape_restores_the_value_and_leaves_no_undo_step(cx: &mut TestAppContext) {
+        let (grid, cx) = grid(cx);
+        bind_editing_keys(cx);
+        focus(cx, &grid);
+
+        edit_cell(cx, &grid, 1, 1);
+        cx.simulate_input("9");
+        assert_eq!(cell(cx, &grid, 1, 1), "889");
+
+        cx.simulate_keystrokes("escape");
+        assert!(!editing(cx, &grid));
+        assert_eq!(cell(cx, &grid, 1, 1), "88");
+
+        // Cancelling is not an edit, so there is nothing to undo and nothing to
+        // save, and the next Cmd+Z must not bring the cancelled text back.
+        cx.simulate_keystrokes("cmd-z");
+        assert_eq!(cell(cx, &grid, 1, 1), "88");
+        assert!(!cx.update(|_window, app| grid.read(app).is_dirty()));
+    }
+
+    #[gpui::test]
+    fn escape_after_a_commit_undoes_the_previous_edit_not_the_cancelled_one(
+        cx: &mut TestAppContext,
+    ) {
+        let (grid, cx) = grid(cx);
+        bind_editing_keys(cx);
+        focus(cx, &grid);
+
+        edit_cell(cx, &grid, 0, 0);
+        cx.simulate_input("1");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(cell(cx, &grid, 0, 0), "ada1");
+
+        // The mark is on row 1 now, so row 0 is opened again by hand.
+        edit_cell(cx, &grid, 0, 0);
+        cx.simulate_input("2");
+        cx.simulate_keystrokes("escape");
+        assert_eq!(cell(cx, &grid, 0, 0), "ada1");
+
+        cx.simulate_keystrokes("cmd-z");
+        assert_eq!(
+            cell(cx, &grid, 0, 0),
+            "ada",
+            "undo reaches the committed edit, not the cancelled one"
+        );
+    }
+
+    #[gpui::test]
+    fn clicking_another_cell_commits_the_open_edit(cx: &mut TestAppContext) {
+        let (grid, cx) = grid(cx);
+        bind_editing_keys(cx);
+        focus(cx, &grid);
+
+        edit_cell(cx, &grid, 0, 1);
+        cx.simulate_input("x");
+        draw(cx);
+        click_at(cx, "row-1", 10.0);
+
+        assert!(!editing(cx, &grid));
+        assert_eq!(cell(cx, &grid, 0, 1), "412x");
+        assert_eq!(
+            mark(cx, &grid),
+            Selection::Cell {
+                position: 1,
+                column: 0
+            }
+        );
+    }
+
+    #[gpui::test]
+    fn sorting_while_editing_commits_first(cx: &mut TestAppContext) {
+        let (grid, cx) = grid(cx);
+        bind_editing_keys(cx);
+        focus(cx, &grid);
+
+        edit_cell(cx, &grid, 0, 1);
+        cx.simulate_input("x");
+        draw(cx);
+        click(cx, "header-1");
+
+        assert!(!editing(cx, &grid));
+        // The sort moved the rows, so the value is read from the table rather
+        // than from the position it used to occupy.
+        assert_eq!(
+            cx.update(|_window, app| grid.read(app).document.table.get(0, 1).map(str::to_string)),
+            Some("412x".to_string())
+        );
+        assert!(cx.update(|_window, app| grid.read(app).sort()).is_some());
+    }
+
+    #[gpui::test]
+    fn the_left_and_right_keys_move_the_caret_while_a_cell_is_open(cx: &mut TestAppContext) {
+        let (grid, cx) = grid(cx);
+        bind_editing_keys(cx);
+        focus(cx, &grid);
+
+        edit_cell(cx, &grid, 0, 1);
+        cx.simulate_keystrokes("left left");
+        assert_eq!(caret(cx, &grid), Some(1));
+        assert_eq!(
+            mark(cx, &grid),
+            Selection::Cell {
+                position: 0,
+                column: 1
+            },
+            "the mark must not slide out from under the open cell"
+        );
+
+        cx.simulate_keystrokes("right");
+        assert_eq!(caret(cx, &grid), Some(2));
+    }
+
+    #[gpui::test]
+    fn the_up_and_down_keys_commit_and_move_the_mark(cx: &mut TestAppContext) {
+        let (grid, cx) = grid(cx);
+        bind_editing_keys(cx);
+        focus(cx, &grid);
+
+        edit_cell(cx, &grid, 1, 1);
+        cx.simulate_input("9");
+        cx.simulate_keystrokes("down");
+
+        assert!(!editing(cx, &grid));
+        assert_eq!(cell(cx, &grid, 1, 1), "889");
+        assert_eq!(
+            mark(cx, &grid),
+            Selection::Cell {
+                position: 2,
+                column: 1
+            }
+        );
+    }
+
+    #[gpui::test]
+    fn cmd_c_inside_a_cell_copies_the_selection(cx: &mut TestAppContext) {
+        let (grid, cx) = grid(cx);
+        bind_editing_keys(cx);
+        focus(cx, &grid);
+
+        edit_cell(cx, &grid, 0, 1);
+        cx.simulate_keystrokes("home shift-end cmd-c");
+
+        assert_eq!(clipboard_text(cx).as_deref(), Some("412"));
+    }
+
+    #[gpui::test]
+    fn a_paste_with_a_line_break_is_refused_and_explained(cx: &mut TestAppContext) {
+        let (grid, cx) = grid(cx);
+        bind_editing_keys(cx);
+        focus(cx, &grid);
+
+        edit_cell(cx, &grid, 0, 1);
+        cx.write_to_clipboard(ClipboardItem::new_string("a\nb".to_string()));
+        cx.simulate_keystrokes("cmd-v");
+
+        assert_eq!(cell(cx, &grid, 0, 1), "412", "the paste changed nothing");
+        assert!(
+            cx.update(|_window, app| grid.read(app).notice.is_some()),
+            "a refused paste has to say why"
+        );
+        assert!(!cx.update(|_window, app| grid.read(app).is_dirty()));
+    }
+
+    #[gpui::test]
+    fn undo_and_redo_of_a_cell_edit_survive_switching_cells(cx: &mut TestAppContext) {
+        let (grid, cx) = grid(cx);
+        bind_editing_keys(cx);
+        focus(cx, &grid);
+
+        edit_cell(cx, &grid, 0, 1);
+        cx.simulate_input("x");
+        cx.simulate_keystrokes("enter");
+        edit_cell(cx, &grid, 1, 1);
+        cx.simulate_input("y");
+        cx.simulate_keystrokes("enter");
+
+        cx.simulate_keystrokes("cmd-z");
+        assert_eq!(cell(cx, &grid, 1, 1), "88");
+        assert_eq!(cell(cx, &grid, 0, 1), "412x");
+
+        cx.simulate_keystrokes("cmd-z");
+        assert_eq!(cell(cx, &grid, 0, 1), "412");
+
+        cx.simulate_keystrokes("shift-cmd-z");
+        assert_eq!(cell(cx, &grid, 0, 1), "412x");
+    }
+
+    #[gpui::test]
+    fn undo_after_a_row_insert_removes_that_row_and_restores_the_mark(cx: &mut TestAppContext) {
+        let (grid, cx) = grid(cx);
+        bind_editing_keys(cx);
+        focus(cx, &grid);
+
+        // Marked first, because an insert with nothing marked lands at the end
+        // and the mark is what names the row the insert created.
+        click_at(cx, "row-0", 10.0);
+        click(cx, "edit-insert-row");
+        assert_eq!(visible_rows(cx, &grid), 4);
+
+        cx.simulate_keystrokes("cmd-z");
+
+        assert_eq!(visible_rows(cx, &grid), 3);
+        assert_eq!(mark(cx, &grid), Selection::Row { position: 1 });
+        assert!(!cx.update(|_window, app| grid.read(app).is_dirty()));
+    }
+
+    #[gpui::test]
+    fn a_committed_value_widens_only_its_own_column(cx: &mut TestAppContext) {
+        let (grid, cx) = grid(cx);
+        bind_editing_keys(cx);
+        focus(cx, &grid);
+        let before = cx.update(|_window, app| grid.read(app).column_widths.clone());
+
+        edit_cell(cx, &grid, 0, 1);
+        cx.simulate_input(" with a much longer value than before");
+        cx.simulate_keystrokes("enter");
+
+        let after = cx.update(|_window, app| grid.read(app).column_widths.clone());
+        assert!(after[1] > before[1], "the edited column grows to fit");
+        assert_eq!(after[0], before[0], "the other column keeps its width");
+    }
+
+    #[gpui::test]
+    fn a_value_that_stops_matching_the_filter_drops_the_mark_on_commit(cx: &mut TestAppContext) {
+        let (grid, cx) = grid(cx);
+        bind_editing_keys(cx);
+        focus(cx, &grid);
+
+        cx.simulate_input("ada");
+        assert_eq!(visible_rows(cx, &grid), 1);
+
+        edit_cell(cx, &grid, 0, 0);
+        cx.simulate_keystrokes("cmd-a");
+        cx.simulate_input("zzz");
+        cx.simulate_keystrokes("enter");
+
+        assert_eq!(visible_rows(cx, &grid), 0);
+        assert_eq!(mark(cx, &grid), Selection::None);
+    }
+
+    #[gpui::test]
+    fn the_caret_and_the_strip_name_the_cell_being_edited(cx: &mut TestAppContext) {
+        let (grid, cx) = grid(cx);
+        bind_editing_keys(cx);
+        focus(cx, &grid);
+
+        edit_cell(cx, &grid, 1, 1);
+
+        assert!(
+            cx.debug_bounds("cell-caret").is_some(),
+            "an open cell draws a caret"
+        );
+        let label = cx
+            .debug_bounds("editing-cell")
+            .expect("the strip names the edited cell");
+        let row = cx.debug_bounds("row-1").expect("the row is drawn");
+        assert!(label.origin.y > row.origin.y, "the label sits in the strip");
+    }
+
+    #[gpui::test]
+    fn save_commits_the_open_cell_and_clears_the_unsaved_state(cx: &mut TestAppContext) {
+        let directory =
+            std::env::temp_dir().join(format!("bromine-cell-save-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("the temporary directory is created");
+        let path = directory.join("cells.csv");
+        std::fs::write(&path, "name,commits\nada,412\n").expect("the fixture is written");
+
+        let (grid, cx) = cx.add_window_view(|_window, cx| {
+            let document = load_csv(&path).expect("the fixture loads");
+            CsvGrid::new(path.clone(), document, cx)
+        });
+        bind_editing_keys(cx);
+        focus(cx, &grid);
+
+        edit_cell(cx, &grid, 0, 1);
+        cx.simulate_input("9");
+        cx.update(|_window, app| grid.update(app, |grid, cx| grid.save(cx)));
+
+        assert!(!editing(cx, &grid), "saving closes the open cell");
+        assert!(!cx.update(|_window, app| grid.read(app).is_dirty()));
+        let saved = std::fs::read_to_string(&path).expect("the file is readable");
+        assert_eq!(saved, "name,commits\nada,4129\n");
+
+        std::fs::remove_dir_all(&directory).expect("the temporary directory is removed");
+    }
+
+    #[gpui::test]
+    fn a_lossy_file_can_be_edited_but_still_refuses_to_save(cx: &mut TestAppContext) {
+        let directory =
+            std::env::temp_dir().join(format!("bromine-cell-lossy-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("the temporary directory is created");
+        let path = directory.join("lossy.csv");
+        let original = b"name,commits\nada,412\n".to_vec();
+        std::fs::write(&path, &original).expect("the fixture is written");
+
+        let (grid, cx) = cx.add_window_view(|_window, cx| {
+            let mut document = load_csv(&path).expect("the fixture loads");
+            document.lossy = true;
+            CsvGrid::new(path.clone(), document, cx)
+        });
+        bind_editing_keys(cx);
+        focus(cx, &grid);
+
+        edit_cell(cx, &grid, 0, 1);
+        cx.simulate_input("9");
+        cx.simulate_keystrokes("enter");
+        assert_eq!(cell(cx, &grid, 0, 1), "4129", "the edit is kept in memory");
+
+        cx.update(|_window, app| grid.update(app, |grid, cx| grid.save(cx)));
+        assert!(cx.update(|_window, app| grid.read(app).save_error.is_some()));
+        assert_eq!(
+            std::fs::read(&path).expect("the file is readable"),
+            original,
+            "a lossy document must leave the file alone"
+        );
+
+        std::fs::remove_dir_all(&directory).expect("the temporary directory is removed");
     }
 }

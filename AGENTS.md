@@ -44,8 +44,8 @@ build, or a change to the dependency set or profile, pays the full cost.
 ## Layout
 
 - `crates/bromine-core/` — format engines. Parsing, the table model, sorting,
-  searching, writing, and the Markdown/plain-text document models with their
-  undo history. **No GPUI dependency.**
+  searching, writing, the Markdown/plain-text document models with their undo
+  history, and `edits.rs`, the table's edit history. **No GPUI dependency.**
 - `crates/bromine-ui/` — GPUI views. Depends on `bromine-core` and `gpui`.
 - `crates/bromine/` — the binary. Argument parsing, menu bar, file loading, window setup.
 - `assets/` — `icon.svg` (the icon source) and the committed `AppIcon.icns`.
@@ -192,6 +192,14 @@ them after an upgrade.
   to `.track_focus(..)` is what makes a context-scoped `KeyBinding` match. A
   binding that finds a listener suppresses `on_key_down` for that keystroke, so a
   shortcut the grid wants for itself (Cmd+C, Cmd+S) must not be bound anywhere.
+- **A context can be conditional.** `.when(cell_is_open, |el| el.key_context("TextEditor"))`
+  is how the CSV grid borrows the text editors' key map for exactly as long as a
+  cell is open. With no cell open the grid is not in that context, so a plain `a`
+  still reaches `on_key_down` and filters the table. The trap on the other side
+  is inserting a character in two places: while the context is on,
+  `dispatch_keystroke` hands the character to the input handler only when the key
+  event propagates, so `on_key_down` must return immediately while a cell is open
+  (Escape is the one exception) or every character arrives twice.
 - **Clipboard reads and writes are on `App`.** `cx.write_to_clipboard(
   ClipboardItem::new_string(text))` and `cx.read_from_clipboard()`, which returns
   `Option<ClipboardItem>` (call `.text()` for the string). There is no
@@ -314,6 +322,11 @@ Two more details worth knowing:
 - **`VisualTestContext::simulate_event` dispatches any `InputEvent`, including
   `ScrollWheelEvent`.** Hover the element with `simulate_mouse_move` first,
   because hit testing uses the window's mouse position rather than the event's.
+- **A test starts with no keymap.** `simulate_keystrokes("cmd-c")` only reaches a
+  binding the test installed itself, so a view test calls
+  `text_actions::bind_text_editor_keys` (and `cx.bind_keys` for anything global)
+  before typing. Without that the keystroke falls through to `on_key_down`, which
+  is a different code path and a silently passing test.
 
 There is no rendered-text reader. Assert on view state (`cell_at`,
 `visible_row_count`) or on `debug_bounds`, never on what "looks right".
@@ -377,10 +390,12 @@ Rules that keep this working:
   is also why cold builds are slow; do not lower it to speed up the first build
   without measuring the frame rate first.
 - All text editing goes through `crates/bromine-ui/src/editor.rs` and its
-  `TextBuffer` trait, which both `TextDocument` and the Markdown model
-  implement. Views supply layout, click mapping, and the few operations that
-  need their own structure (table cells, list continuation); typing, deletion,
-  navigation, clipboard, and undo are shared.
+  `TextBuffer` trait, which `TextDocument`, the Markdown model, and the CSV
+  grid's one-cell `CellBuffer` all implement. Views supply layout, click mapping,
+  and the few operations that need their own structure (table cells, list
+  continuation); typing, deletion, navigation, clipboard, and undo are shared.
+  The grid's undo goes through `TableEdits` in core rather than the view, so a
+  cell edit and a row insert share one history.
 - Match the surrounding style. Prefer a doc comment explaining *why* over one
   restating *what*.
 
