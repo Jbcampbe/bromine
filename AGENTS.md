@@ -99,6 +99,11 @@ stitched shader source compiled on first launch instead. Consequences:
   `dist/Bromine-<version>-<arch>.dmg` containing the app and an `/Applications`
   symlink. It never invokes cargo, and it refuses when the binary or the icon is
   missing.
+- `packaging/Info.plist` declares CSV, TSV, JSON, Markdown, and plain text as
+  document types with `LSHandlerRank` `Default`, so Finder offers Bromine in
+  **Open With** and treats it as a default candidate. A new format needs a
+  matching entry there, or double-clicking one of its files never launches the
+  app.
 - `SIGN_IDENTITY` overrides the ad-hoc signature. Any identity other than `-`
   also turns on the hardened runtime and a secure timestamp, which notarization
   requires.

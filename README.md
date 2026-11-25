@@ -170,6 +170,10 @@ is needed.
 
 Requires macOS 11 or newer.
 
+Bromine declares CSV, TSV, JSON, Markdown, and plain text as document types, so
+Finder offers it in **Open With**. The bundle ranks itself as the default
+handler for each; macOS still lets you choose another app in **Get Info**.
+
 These builds are **ad-hoc signed, not notarized**: there is no paid Apple
 Developer ID behind them, so macOS quarantine refuses the first launch. Either
 right-click the app and choose **Open** once, or clear the flag:
@@ -294,10 +298,10 @@ compile cycle to learn. `DESIGN.md` records the visual brief.
 
 ```bash
 cargo build --release --target aarch64-apple-darwin -p bromine
-./scripts/bundle-macos.sh aarch64-apple-darwin 0.1.0 aarch64
+./scripts/bundle-macos.sh aarch64-apple-darwin 0.2.0 aarch64
 ```
 
-That writes `dist/Bromine.app` and `dist/Bromine-0.1.0-aarch64.dmg`. Set
+That writes `dist/Bromine.app` and `dist/Bromine-0.2.0-aarch64.dmg`. Set
 `SIGN_IDENTITY` to a Developer ID identity to sign with it instead of ad-hoc.
 The icon is regenerated from `assets/icon.svg` with `./scripts/make-icon.sh`
 (needs `rsvg-convert`).
