@@ -8,5 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 csv.workspace = true
+pulldown-cmark.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+unicode-segmentation.workspace = true

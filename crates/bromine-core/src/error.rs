@@ -41,6 +41,17 @@ pub enum CoreError {
     #[error("row {row} does not exist (table has {rows} rows)")]
     NoSuchRow { row: usize, rows: usize },
 
+    /// The file holds NUL bytes near the start, so it is not text and no
+    /// editor can show it without inventing a decoding.
+    #[error("{path} looks like a binary file, so it cannot be shown as text")]
+    Binary { path: PathBuf },
+
+    /// A file that had to be decoded lossily cannot be written back, because
+    /// the replacement characters would overwrite bytes the viewer could not
+    /// read.
+    #[error("not saved: {path} is not valid UTF-8, so writing it back would lose data")]
+    Lossy { path: PathBuf },
+
     /// The path has no extension Bromine recognises at all.
     #[error("{path} is not a format Bromine can open")]
     UnsupportedFormat { path: PathBuf },

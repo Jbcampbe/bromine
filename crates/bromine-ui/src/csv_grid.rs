@@ -328,11 +328,10 @@ impl CsvGrid {
 
     /// Write the table back over the file it came from.
     ///
-    /// A file that had to be decoded lossily cannot be written back without
-    /// destroying the bytes that would not decode, so it refuses instead of
-    /// quietly damaging the original. Padded and unnamed columns are repairs the
-    /// status strip already shows, and they write back as they look.
-    fn save(&mut self, cx: &mut Context<Self>) {
+    /// This is the tab's save entry point, called by the workspace's `Save`
+    /// action. The grid no longer listens for Cmd+S itself: actions run before
+    /// key listeners, so one global binding is the honest place for it.
+    pub fn save(&mut self, cx: &mut Context<Self>) {
         if self.document.lossy {
             self.save_error = Some(SharedString::from(
                 "not saved: this file is not valid UTF-8, so writing it back would lose data",
@@ -464,10 +463,8 @@ impl CsvGrid {
 
         // The editing keys go first, and never into the search box.
         if event.keystroke.modifiers.platform {
-            match key {
-                "c" => self.copy_selection(cx),
-                "s" => self.save(cx),
-                _ => {}
+            if key == "c" {
+                self.copy_selection(cx);
             }
             return;
         }
@@ -2042,7 +2039,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn an_edit_marks_the_document_dirty_and_cmd_s_writes_it_back(cx: &mut TestAppContext) {
+    fn an_edit_marks_the_document_dirty_and_save_writes_it_back(cx: &mut TestAppContext) {
         let directory = std::env::temp_dir().join(format!("bromine-save-{}", std::process::id()));
         std::fs::create_dir_all(&directory).expect("the temporary directory is created");
         let path = directory.join("edits.csv");
@@ -2058,7 +2055,7 @@ mod tests {
         assert_eq!(visible_rows(cx, &grid), 2);
         assert!(cx.update(|_window, app| grid.read(app).dirty));
 
-        cx.simulate_keystrokes("cmd-s");
+        cx.update(|_window, app| grid.update(app, |grid, cx| grid.save(cx)));
 
         assert!(!cx.update(|_window, app| grid.read(app).dirty));
         let reloaded = load_csv(&path).expect("the saved file still loads");
@@ -2084,7 +2081,7 @@ mod tests {
         focus(cx, &grid);
 
         click(cx, "edit-insert-row");
-        cx.simulate_keystrokes("cmd-s");
+        cx.update(|_window, app| grid.update(app, |grid, cx| grid.save(cx)));
 
         assert!(
             cx.update(|_window, app| grid.read(app).save_error.is_some()),

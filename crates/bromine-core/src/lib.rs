@@ -16,13 +16,21 @@
 mod csv;
 mod error;
 mod json;
+mod markdown;
 mod table;
+mod text;
 mod view;
 
 pub use csv::{CsvDocument, load_csv, parse_csv};
 pub use error::CoreError;
 pub use json::{JsonDocument, load_json, parse_json};
+pub use markdown::{
+    Alignment, Block, BlockId, BlockKind, CellEdit, CellPosition, ImageInfo, ImageLocation,
+    ListMarker, MarkdownDocument, Row, RowKind, Run, RunStyle, TableBlock, TableCell,
+    load_markdown,
+};
 pub use table::{Repairs, Table};
+pub use text::{EditKind, LineEnding, TextDocument, UndoOutcome};
 pub use view::{Direction, RowView, SortKey, compare_values};
 
 /// Formats Bromine can open today.
@@ -31,6 +39,7 @@ pub enum Format {
     Csv,
     Json,
     Markdown,
+    Text,
 }
 
 impl Format {
@@ -41,6 +50,7 @@ impl Format {
             "csv" | "tsv" => Some(Self::Csv),
             "json" => Some(Self::Json),
             "md" | "markdown" | "mdx" => Some(Self::Markdown),
+            "txt" | "text" | "log" => Some(Self::Text),
             _ => None,
         }
     }
@@ -52,6 +62,7 @@ impl std::fmt::Display for Format {
             Self::Csv => "CSV",
             Self::Json => "JSON",
             Self::Markdown => "Markdown",
+            Self::Text => "text",
         })
     }
 }
@@ -66,6 +77,8 @@ impl std::fmt::Display for Format {
 pub enum Document {
     Csv(CsvDocument),
     Json(JsonDocument),
+    Markdown(MarkdownDocument),
+    Text(TextDocument),
 }
 
 /// Load whatever `path` holds, or explain why it cannot be shown.
@@ -77,10 +90,8 @@ pub fn load_document(path: &std::path::Path) -> Result<Document, CoreError> {
     match Format::from_path(path) {
         Some(Format::Csv) => load_csv(path).map(Document::Csv),
         Some(Format::Json) => load_json(path).map(Document::Json),
-        Some(format) => Err(CoreError::NotImplemented {
-            path: path.to_path_buf(),
-            format,
-        }),
+        Some(Format::Markdown) => load_markdown(path).map(Document::Markdown),
+        Some(Format::Text) => TextDocument::load(path).map(Document::Text),
         None => Err(CoreError::UnsupportedFormat {
             path: path.to_path_buf(),
         }),
@@ -141,24 +152,51 @@ mod tests {
     }
 
     #[test]
-    fn a_known_format_without_a_viewer_says_not_yet_rather_than_never() {
-        let error = load_document(Path::new("notes.md")).unwrap_err();
-        let message = error.to_string();
+    fn a_markdown_path_loads_through_the_dispatch() {
+        let document = load_document(&fixture("notes.md")).expect("notes.md loads");
+        let Document::Markdown(document) = document else {
+            panic!("a .md path must dispatch to the Markdown engine");
+        };
+        assert!(document.rows().len() > 1);
+        assert!(
+            document
+                .blocks()
+                .iter()
+                .any(|block| matches!(block.kind, BlockKind::Heading(1))),
+            "the fixture starts with a heading"
+        );
+    }
 
-        assert!(
-            message.contains("Markdown"),
-            "unexpected message: {message}"
-        );
-        assert!(
-            message.contains("cannot show yet"),
-            "unexpected message: {message}"
-        );
-        assert!(matches!(error, CoreError::NotImplemented { .. }));
+    #[test]
+    fn a_text_path_loads_through_the_dispatch() {
+        let document = load_document(&fixture("readme.txt")).expect("readme.txt loads");
+        let Document::Text(document) = document else {
+            panic!("a .txt path must dispatch to the text engine");
+        };
+        assert!(document.text().contains("Bromine"));
+    }
+
+    #[test]
+    fn every_text_extension_dispatches_to_the_text_engine() {
+        for name in ["notes.txt", "notes.text", "server.log"] {
+            assert_eq!(
+                Format::from_path(Path::new(name)),
+                Some(Format::Text),
+                "{name} should be text"
+            );
+        }
+        for name in ["notes.md", "notes.markdown", "notes.mdx"] {
+            assert_eq!(
+                Format::from_path(Path::new(name)),
+                Some(Format::Markdown),
+                "{name} should be Markdown"
+            );
+        }
     }
 
     #[test]
     fn an_unknown_extension_is_reported_as_unopenable() {
-        let error = load_document(Path::new("notes.txt")).unwrap_err();
+        let error = load_document(Path::new("notes.toml")).unwrap_err();
 
         assert!(matches!(error, CoreError::UnsupportedFormat { .. }));
         assert!(

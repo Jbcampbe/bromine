@@ -74,6 +74,30 @@ pub fn selection_strong() -> Hsla {
     hsla(0.55, 0.70, 0.65, 0.30)
 }
 
+/// The wash behind inline code and fenced code blocks.
+pub fn code_surface() -> Hsla {
+    hsla(0.611, 0.08, 0.16, 1.0)
+}
+
+/// The vertical bar beside a blockquote.
+pub fn quote_bar() -> Hsla {
+    hsla(0.611, 0.08, 0.30, 1.0)
+}
+
+/// The box standing in for an image that cannot be shown.
+pub fn image_placeholder() -> Hsla {
+    hsla(0.611, 0.08, 0.13, 1.0)
+}
+
+/// The font for prose in the Markdown view.
+///
+/// The system font is what Bear and every other macOS writing app uses; a
+/// bundled serif would be a larger change than this view needs. GPUI falls back
+/// to its default if the family is missing.
+pub fn prose_font() -> &'static str {
+    "Helvetica Neue"
+}
+
 /// The font for cell values and column headers.
 ///
 /// Values are monospaced so digit columns line up and can be compared by eye.

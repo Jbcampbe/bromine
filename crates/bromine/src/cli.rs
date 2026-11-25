@@ -23,7 +23,8 @@ pub(crate) enum Invocation {
 pub(crate) const USAGE: &str = "\
 Usage: bromine [options] [file...]
 
-Open CSV, TSV, or JSON files in tabs. With no files the window starts empty.
+Open CSV, TSV, JSON, Markdown, or text files in tabs. With no files the
+window starts empty.
 
 Options:
   -h, --help     Show this help and exit

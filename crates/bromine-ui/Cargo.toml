@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 bromine-core.workspace = true
 gpui.workspace = true
+unicode-segmentation.workspace = true
 
 [dev-dependencies]
 # The view tests drive real frames, which needs gpui's test instrumentation

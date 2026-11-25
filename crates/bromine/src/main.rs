@@ -15,7 +15,7 @@ use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use bromine_ui::{CloseTab, OpenFile, Quit, Workspace};
+use bromine_ui::{CloseTab, OpenFile, Quit, Save, Workspace, bind_text_editor_keys};
 use gpui::{
     App, Application, AsyncApp, Bounds, Context, Entity, KeyBinding, Menu, MenuItem, SharedString,
     SystemMenuType, TitlebarOptions, Window, WindowBounds, WindowHandle, WindowOptions, prelude::*,
@@ -149,7 +149,9 @@ fn main() {
             KeyBinding::new("cmd-o", OpenFile, None),
             KeyBinding::new("cmd-w", CloseTab, None),
             KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("cmd-s", Save, None),
         ]);
+        bind_text_editor_keys(cx);
 
         // GPUI installs no menu bar unless asked, and without one there is no
         // Quit item and Cmd+Q does nothing. The key equivalents themselves come
@@ -168,6 +170,8 @@ fn main() {
                 name: "File".into(),
                 items: vec![
                     MenuItem::action("Open\u{2026}", OpenFile),
+                    MenuItem::action("Save", Save),
+                    MenuItem::separator(),
                     MenuItem::action("Close Tab", CloseTab),
                 ],
             },

@@ -14,9 +14,11 @@ use gpui::{
 
 use crate::csv_grid::CsvGrid;
 use crate::json_view::JsonView;
+use crate::markdown_view::MarkdownView;
+use crate::text_view::TextView;
 use crate::theme;
 
-actions!(bromine, [OpenFile, CloseTab, Quit]);
+actions!(bromine, [OpenFile, CloseTab, Quit, Save]);
 
 /// One open document, whichever viewer it needs.
 ///
@@ -27,6 +29,8 @@ actions!(bromine, [OpenFile, CloseTab, Quit]);
 pub(crate) enum TabView {
     Csv(Entity<CsvGrid>),
     Json(Entity<JsonView>),
+    Text(Entity<TextView>),
+    Markdown(Entity<MarkdownView>),
 }
 
 impl TabView {
@@ -35,6 +39,8 @@ impl TabView {
         match self {
             Self::Csv(grid) => grid.read(cx).path().to_path_buf(),
             Self::Json(view) => view.read(cx).path().to_path_buf(),
+            Self::Text(view) => view.read(cx).path().to_path_buf(),
+            Self::Markdown(view) => view.read(cx).path().to_path_buf(),
         }
     }
 
@@ -43,6 +49,8 @@ impl TabView {
         match self {
             Self::Csv(grid) => grid.read(cx).focus_handle().clone(),
             Self::Json(view) => view.read(cx).focus_handle().clone(),
+            Self::Text(view) => view.read(cx).focus_handle().clone(),
+            Self::Markdown(view) => view.read(cx).focus_handle().clone(),
         }
     }
 
@@ -50,6 +58,8 @@ impl TabView {
         match self {
             Self::Csv(grid) => grid.read(cx).focus(window),
             Self::Json(view) => view.read(cx).focus(window),
+            Self::Text(view) => view.read(cx).focus(window),
+            Self::Markdown(view) => view.read(cx).focus(window),
         }
     }
 
@@ -58,6 +68,18 @@ impl TabView {
         match self {
             Self::Csv(grid) => grid.read(cx).is_dirty(),
             Self::Json(view) => view.read(cx).is_dirty(),
+            Self::Text(view) => view.read(cx).is_dirty(),
+            Self::Markdown(view) => view.read(cx).is_dirty(),
+        }
+    }
+
+    /// Write this tab back to its file. Read-only views do nothing.
+    fn save(&self, cx: &mut App) {
+        match self {
+            Self::Csv(grid) => grid.update(cx, |grid, cx| grid.save(cx)),
+            Self::Json(_) => {}
+            Self::Text(view) => view.update(cx, |view, cx| view.save(cx)),
+            Self::Markdown(view) => view.update(cx, |view, cx| view.save(cx)),
         }
     }
 }
@@ -173,6 +195,16 @@ impl Workspace {
                 let view = cx.new(|cx| JsonView::new(path, document, cx));
                 self.track(&view, cx);
                 self.tabs.push(TabView::Json(view));
+            }
+            Ok(Document::Text(document)) => {
+                let view = cx.new(|cx| TextView::new(path, document, cx));
+                self.track(&view, cx);
+                self.tabs.push(TabView::Text(view));
+            }
+            Ok(Document::Markdown(document)) => {
+                let view = cx.new(|cx| MarkdownView::new(path, document, cx));
+                self.track(&view, cx);
+                self.tabs.push(TabView::Markdown(view));
             }
             Err(error) => {
                 self.error = Some(SharedString::from(error.to_string()));
@@ -327,6 +359,16 @@ impl Workspace {
 
     fn quit(&mut self, _: &Quit, _window: &mut Window, cx: &mut Context<Self>) {
         self.request_quit(cx);
+    }
+
+    /// Save the visible document.
+    ///
+    /// This is the one place a tab's unsaved edits become bytes on disk, so the
+    /// menu item, Cmd+S, and any future affordance all share it.
+    fn save(&mut self, _: &Save, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.active_tab() {
+            tab.save(cx);
+        }
     }
 
     /// The index of an already-open document with the same file behind `path`.
@@ -520,6 +562,8 @@ impl Workspace {
         let content: Option<AnyElement> = match self.active_tab() {
             Some(TabView::Csv(grid)) => Some(grid.clone().into_any_element()),
             Some(TabView::Json(view)) => Some(view.clone().into_any_element()),
+            Some(TabView::Text(view)) => Some(view.clone().into_any_element()),
+            Some(TabView::Markdown(view)) => Some(view.clone().into_any_element()),
             None => None,
         };
 
@@ -550,6 +594,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_file))
             .on_action(cx.listener(Self::close_tab))
             .on_action(cx.listener(Self::quit))
+            .on_action(cx.listener(Self::save))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _event: &MouseDownEvent, window, _cx| {
@@ -625,9 +670,61 @@ mod tests {
             app.bind_keys([
                 KeyBinding::new("cmd-o", OpenFile, None),
                 KeyBinding::new("cmd-w", CloseTab, None),
+                KeyBinding::new("cmd-s", Save, None),
             ]);
             workspace.read(app).focus_active(window, app);
         });
+    }
+
+    #[gpui::test]
+    fn opening_a_markdown_file_creates_a_markdown_tab(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(|_window, cx| Workspace::new(cx));
+
+        let opened = cx.update(|_window, app| {
+            workspace.update(app, |workspace, cx| workspace.open(fixture("notes.md"), cx))
+        });
+
+        assert!(opened);
+        assert_eq!(tab_count(cx, &workspace), 1);
+        assert!(
+            cx.update(|_window, app| workspace.read(app).tabs.first().is_some_and(
+                |tab| matches!(tab, TabView::Markdown(view) if view.read(app).path().ends_with("notes.md"))
+            )),
+            "the Markdown file should open in the Markdown view"
+        );
+    }
+
+    #[gpui::test]
+    fn cmd_s_saves_the_visible_markdown_tab(cx: &mut TestAppContext) {
+        let directory =
+            std::env::temp_dir().join(format!("bromine-workspace-save-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("the temporary directory is created");
+        let path = directory.join("notes.md");
+        std::fs::write(&path, "# Title\n").expect("the file is written");
+
+        let (workspace, cx) = cx.add_window_view(|_window, cx| Workspace::new(cx));
+        cx.update(|_window, app| {
+            workspace.update(app, |workspace, cx| workspace.open(path.clone(), cx))
+        });
+        bind_shortcuts(cx, &workspace);
+        cx.update(|window, app| window.draw(app).clear());
+
+        cx.simulate_input("X");
+        cx.simulate_keystrokes("cmd-s");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the file reads back"),
+            "X# Title\n"
+        );
+        assert!(
+            cx.update(|_window, app| workspace
+                .read(app)
+                .active_tab()
+                .is_some_and(|tab| !tab.is_dirty(app))),
+            "saving clears the dirty flag"
+        );
+
+        std::fs::remove_dir_all(&directory).expect("the temporary directory is removed");
     }
 
     #[gpui::test]
@@ -898,7 +995,7 @@ mod tests {
         let (workspace, cx) = cx.add_window_view(|_window, cx| Workspace::new(cx));
 
         let opened = cx.update(|_window, app| {
-            workspace.update(app, |workspace, cx| workspace.open("notes.txt", cx))
+            workspace.update(app, |workspace, cx| workspace.open("notes.yaml", cx))
         });
 
         assert!(!opened);
@@ -918,7 +1015,7 @@ mod tests {
 
         cx.update(|_window, app| {
             workspace.update(app, |workspace, cx| {
-                workspace.open("notes.txt", cx);
+                workspace.open("notes.yaml", cx);
                 workspace.open(fixture("people.csv"), cx);
             })
         });

@@ -44,7 +44,8 @@ build, or a change to the dependency set or profile, pays the full cost.
 ## Layout
 
 - `crates/bromine-core/` — format engines. Parsing, the table model, sorting,
-  searching, and writing. **No GPUI dependency.**
+  searching, writing, and the Markdown/plain-text document models with their
+  undo history. **No GPUI dependency.**
 - `crates/bromine-ui/` — GPUI views. Depends on `bromine-core` and `gpui`.
 - `crates/bromine/` — the binary. Argument parsing, menu bar, file loading, window setup.
 - `assets/` — `icon.svg` (the icon source) and the committed `AppIcon.icns`.
@@ -238,9 +239,45 @@ them after an upgrade.
 - **GPUI installs no menu bar unless the app calls `App::set_menus`.** Without
   one there is no Quit item and Cmd+Q does nothing. The key equivalents shown
   in the menu come from the keymap, so `cx.bind_keys` has to run before
-  `cx.set_menus`. There is deliberately no Edit > Copy: a `cmd-c` binding
-  suppresses the grid's `on_key_down` copy, so that menu item waits for the
-  text-editing foundation.
+  `cx.set_menus`. There is deliberately no Edit menu: Copy and Cut are bound
+  only in the `TextEditor` key context, so they do not suppress the grid's own
+  copy handler, and a menu item needs a global action.
+
+- **`TextRun` carries no font size.** `StyledText::new(text).with_runs(runs)`
+  takes `TextRun { len, font, color, background_color, underline, strikethrough }`,
+  and the size comes from the shaped line's `font_size`. Inline code is
+  therefore distinguished by its face and background, not its size.
+- **`TextSystem::shape_text` needs a window.** `Window::text_system()` gives the
+  `WindowTextSystem`; `shape_text(text, font_size, &runs, wrap_width, line_clamp)`
+  returns `SmallVec<[WrappedLine; 1]>`. `WrappedLine` derefs to
+  `WrappedLineLayout`, whose `index_for_position`, `closest_index_for_position`,
+  and `position_for_index` map between a point and a byte offset. That is the
+  only reliable way to turn a click into a caret in proportional, wrapped
+  prose, and it is why each Markdown row is a custom element that records its
+  layout during paint.
+- **`request_measured_layout(style, measure)` takes no element list.** The
+  closure receives `(known_size, available_space, window, cx)` and returns a
+  `Size<Pixels>`. Call it from `Element::request_layout`; the shaped line is
+  cached in a `RefCell` for `prepaint` to take.
+- **There is still no text field widget.** A view becomes a real editor by
+  implementing `EntityInputHandler` and calling
+  `window.handle_input(&focus_handle, ElementInputHandler::new(bounds, entity), cx)`
+  during paint. `TextInputBridge` in `editor.rs` does exactly that.
+- **`dispatch_keystroke` delivers `key_char` only when the key event
+  propagates.** It sends `KeyDown` first; if a binding or `on_key_down` handles
+  it, the platform input handler never sees the character. Insert characters in
+  the input handler and nowhere else, or every keystroke arrives twice.
+- **Actions are namespaced by their declaration site, not by the string in
+  `actions!`.** `actions!(text_editor, [Backspace])` creates a `Backspace` type
+  in the current module; import it as `crate::text_actions::Backspace`.
+- **`ImageSource` accepts a path or a URI.** `img(path_buf)` loads a local file
+  and `img("https://…")` loads a remote one through the app's image loader.
+  `Img` implements `Styled` (so `max_w`/`max_h` work) and `StyledImage`
+  (`with_loading`, `with_fallback`, `object_fit`). Loading and fallback closures
+  return `AnyElement`.
+- **`uniform_list` needs a `UniformListScrollHandle`.** Its `track_scroll` will
+  not take a plain `ScrollHandle`, so the read-only Markdown fallback lets the
+  list own its scrolling rather than trying to drive it.
 
 ## Testing views
 
@@ -273,9 +310,10 @@ There is no rendered-text reader. Assert on view state (`cell_at`,
 
 `Workspace` is the window's root view. It owns a `Vec<TabView>`, one per open
 document, plus the index of the visible one. `TabView` is an enum over
-`Entity<CsvGrid>` and `Entity<JsonView>`, so a new format adds a variant and one
-arm per accessor (`path`, `focus_handle`, `focus`, `is_dirty`) instead of a
-second parallel list of tabs. `Workspace::open` is the only place that has to
+`Entity<CsvGrid>`, `Entity<JsonView>`, `Entity<TextView>`, and
+`Entity<MarkdownView>`, so a new format adds a variant and one arm per accessor
+(`path`, `focus_handle`, `focus`, `is_dirty`, `save`) instead of a second
+parallel list of tabs. `Workspace::open` is the only place that has to
 know how a core `Document` becomes a view. Each tab is a live entity, so its
 sort, search, or scroll position survives switching away and back.
 
@@ -300,11 +338,12 @@ Rules that keep this working:
   an absolute dialog path are recognised as the same file.
 - **A failed open is reported in the error strip and changes nothing else.** It
   never ends the process, so one bad command-line argument cannot hide the rest.
-- **Shortcuts are actions, not key matching.** `OpenFile` and `CloseTab` are
-  declared in `bromine-ui/src/workspace.rs`, bound with a `None` context in the
-  binary, and handled by `.on_action` on the workspace root. Do not move them
-  into `CsvGrid::on_key_down`: once a binding exists, that listener never sees
-  the keystroke.
+- **Shortcuts are actions, not key matching.** `OpenFile`, `CloseTab`, `Quit`,
+  and `Save` are declared in `bromine-ui/src/workspace.rs`, bound with a `None`
+  context in the binary, and handled by `.on_action` on the workspace root.
+  `Save` asks the active tab to write itself, which is the single place an edit
+  becomes bytes on disk. Do not move these into a view's `on_key_down`: once a
+  binding exists, that listener never sees the keystroke.
 - **The open panel is shared and cannot be reconfigured while it is up.** A
   `prompting` flag stops a second Cmd+O from mutating the panel already on
   screen.
@@ -325,6 +364,11 @@ Rules that keep this working:
   `opt-level = 3`, so a GUI frame is usable without a release build. That setting
   is also why cold builds are slow; do not lower it to speed up the first build
   without measuring the frame rate first.
+- All text editing goes through `crates/bromine-ui/src/editor.rs` and its
+  `TextBuffer` trait, which both `TextDocument` and the Markdown model
+  implement. Views supply layout, click mapping, and the few operations that
+  need their own structure (table cells, list continuation); typing, deletion,
+  navigation, clipboard, and undo are shared.
 - Match the surrounding style. Prefer a doc comment explaining *why* over one
   restating *what*.
 

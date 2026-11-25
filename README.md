@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>The data viewer for files you keep opening in a terminal.</strong><br>
-  CSV, TSV, and JSON in a fast, native macOS window.
+  CSV, TSV, JSON, Markdown, and text in a fast, native macOS window.
 </p>
 
 <p align="center">
@@ -39,7 +39,8 @@ upload, no telemetry.
 
 - **One window for the awkward formats.** Comma- and tab-delimited text, quoted
   commas and embedded newlines, ragged rows, JSON with keys in the order they
-  were written. Markdown is next.
+  were written, Markdown that reads like prose until you click it, and plain
+  text with honest line numbers.
 - **Speed that holds up on big files.** Rows and JSON lines are virtualized. A
   200,000-row CSV is parsed once and only the visible rows are ever laid out.
 - **The spreadsheet conventions you already know.** Row numbers down the left
@@ -92,6 +93,37 @@ complained about stays easy to reach, and the whole file stays visible.
   `path:line:column: message`.
 - **Read only, and it says so** in the status strip.
 
+## Markdown and text
+
+Markdown opens as prose with its punctuation hidden, except in the block the
+caret is in. Click a paragraph and its `**bold**` and `#` markers appear in
+place; click away and they disappear again. That is the Bear arrangement:
+quiet to read, literal to edit.
+
+- **Lists continue themselves.** `Enter` after a list item starts the next one,
+  incrementing ordered numbers and carrying task checkboxes. `Tab` and
+  `Shift+Tab` indent and outdent; clicking a checkbox writes `[x]` back to the
+  source.
+- **Tables are grids, not pipes.** The delimiter row never appears. The active
+  table gets a toolbar for adding and removing rows and columns and for setting
+  each column's alignment. A cell edit is clamped to that cell, so typing can
+  never eat a pipe.
+- **Images are blocks.** A relative path resolves beside the Markdown file, and
+  `http(s)` images load through the same cache. A missing image leaves a
+  bordered placeholder with its alt text and destination instead of a hole.
+- **`Cmd+B` and `Cmd+I`** wrap the selection, and a document over 2 MB or
+  20,000 rows opens read-only with the reason in the status strip.
+
+Plain text (`.txt`, `.text`, `.log`) is one monospace size with line numbers,
+tabs expanded to four spaces, and no wrapping. A long log line scrolls sideways
+instead of folding. The status strip carries line and column, the line count,
+and the saved state. CRLF line endings and a UTF-8 byte-order mark survive a
+round trip; a file that was not valid UTF-8 can be read but is never written
+back.
+
+Every edit, in either view, supports undo and redo. Typing and runs of
+backspace coalesce into one step, and moving the caret starts a new one.
+
 ## Tabs, edits, and saves
 
 Keep several files open at once as tabs. `Cmd+O` opens files from a native panel,
@@ -118,8 +150,9 @@ the file displayable.
   writing it back would replace bytes Bromine could not read.
 - Repairs made at load do not block a save: what gets written is the rectangle
   you are looking at.
-- There is no undo yet. The app is blunt about unsaved work rather than pretending
-  a structural edit is free.
+- Text and Markdown edits have undo and redo. Structural CSV edits do not yet,
+  so the app is blunt about unsaved work rather than pretending a row removal is
+  free.
 
 ## Install
 
@@ -155,13 +188,13 @@ in a trench coat.
 
 | Layer | Responsibility |
 | :--- | :--- |
-| `crates/bromine-core` | CSV/TSV and JSON parsing, the table model, sorting, searching, and write-back. **No GPUI dependency.** |
-| `crates/bromine-ui` | The GPUI views: tab strip, CSV grid, JSON line view, status strip, and theme tokens. |
+| `crates/bromine-core` | CSV/TSV, JSON, Markdown, and plain-text models, the table model, sorting, searching, write-back, and undo history. **No GPUI dependency.** |
+| `crates/bromine-ui` | The GPUI views: tab strip, CSV grid, JSON line view, text view, Markdown editor, status strip, and theme tokens. |
 | `crates/bromine` | The binary: arguments, menu bar, file loading, and window setup. |
 
 That crate boundary is a hard rule, not an aspiration. Every behaviour worth
-trusting lives in core, where tests run headlessly. The full suite is **123
-tests**: 56 core, 10 fixture contracts, 51 views, and 6 CLI. The view tests drive
+trusting lives in core, where tests run headlessly. The full suite is **180
+tests**: 84 core, 10 fixture contracts, 75 views, and 11 CLI. The view tests drive
 real GPUI frames: they type into the window, click headers and status buttons,
 dispatch wheel events, send `Cmd+C`, `Cmd+S`, and `Cmd+W` through the real keymap,
 and assert on laid-out bounds.
@@ -182,12 +215,15 @@ After that, only what is on screen is drawn.
 
 ## Status
 
-Bromine is early, deliberately small, and open source. CSV/TSV and JSON are wired
-end to end. What is not there yet:
+Bromine is early, deliberately small, and open source. CSV/TSV, JSON, Markdown,
+and plain text are wired end to end. What is not there yet:
 
-- Typing into a cell, with a caret, selection, and undo
-- A Markdown view
+- Typing into a CSV cell (the shared caret, selection, and undo foundation is
+  in place for the text and Markdown views)
 - Editing JSON, or collapsing it into a tree
+- Drag-selection that auto-scrolls past the viewport, a blinking caret, merged
+  or multi-line table cells, and inline images that flow inside a paragraph
+- Spellcheck, find, tags, and a focus mode for Markdown
 - Dragging column edges, draggable scrollbars, and reordering tabs
 - Searching inside a JSON document
 
@@ -205,6 +241,7 @@ end to end. What is not there yet:
 
 ```bash
 cargo run -p bromine -- fixtures/people.csv fixtures/quirky.csv   # two tabs
+cargo run -p bromine -- fixtures/notes.md fixtures/readme.txt     # Markdown and text
 cargo run -p bromine                                              # empty window
 ```
 

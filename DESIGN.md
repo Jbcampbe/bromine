@@ -38,6 +38,9 @@ everywhere. Views must not inline raw colors.
 | `scrollbar` | The drawn scrollbar thumbs |
 | `selection` | The wash behind a marked cell, row, or column |
 | `selection_strong` | The wash behind the one cell that was clicked, so it stands out from the row it is in |
+| `code_surface` | Inline code and fenced blocks in the Markdown view |
+| `quote_bar` | The vertical rule beside a blockquote |
+| `image_placeholder` | The box standing in for an image that cannot be shown |
 
 Add a token rather than a one-off colour. If a colour appears twice in views and
 is not a token, it should be one.
@@ -65,8 +68,11 @@ the window.
 
 ## Type scale
 
-Three sizes is enough: a small size for metadata, a base size for cells and
-labels, and one larger size for a file name or heading. Resist adding a fourth.
+Three sizes are enough for chrome and data: a small size for metadata, a base
+size for cells and labels, and one larger size for a file name or heading.
+Resist adding a fourth. The Markdown view is the exception, because a heading
+level there is content rather than chrome; its six sizes are the document's
+hierarchy, not a new scale for the app.
 
 ## Layout
 
@@ -75,11 +81,12 @@ labels, and one larger size for a file name or heading. Resist adding a fourth.
   tab is distinguished by background, not by an underline or a heavier border.
   Tabs shrink and truncate rather than scrolling; a tab bar that scrolls is a
   later problem.
-- A native menu bar: **Bromine** (Services, Quit) and **File** (Open…, Close
-  Tab). The key equivalent shown beside an item comes from the app's keymap, so
-  the menu names the key the app actually listens for. There is deliberately no
-  Edit menu yet: binding `cmd-c` would suppress the grid's own copy handler, and
-  Copy belongs there only once that conflict is gone.
+- A native menu bar: **Bromine** (Services, Quit) and **File** (Open…, Save,
+  Close Tab). The key equivalent shown beside an item comes from the app's
+  keymap, so the menu names the key the app actually listens for. There is
+  deliberately no Edit menu yet: Copy and Cut are bound only inside the text
+  editors' `TextEditor` context, and a menu item needs a global action. Save is
+  global because every editable tab implements the same `save` entry point.
 - Quit is guarded the way Close Tab is. With unsaved edits the first Cmd+Q
   explains itself in the error strip and the second quits; one keystroke must
   not be able to throw work away. `Workspace::request_quit` owns that rule so
@@ -130,8 +137,9 @@ labels, and one larger size for a file name or heading. Resist adding a fourth.
   row the moment the order or the filter changes.
 - Structural edits come before cell editing: add and remove rows and columns
   from the status strip. A new row is empty and a new column takes its position
-  as a name. Typing into a cell needs the text-input foundation (caret,
-  selection, undo) and is not faked with a half-working field.
+  as a name. Typing into a CSV cell needs the text-input foundation (caret,
+  selection, undo), which now exists in the text and Markdown views, and is not
+  faked with a half-working field until the grid has its own increment.
 - A new row lands below the marked row, or at the end of the file when nothing
   is marked. A new column lands to the right of the marked column, or at the
   right edge. Every edit is resolved against the table through the view, so a
@@ -170,9 +178,47 @@ labels, and one larger size for a file name or heading. Resist adding a fourth.
   When editing arrives it goes through the same edit-then-save model as the
   grid, not through a save-on-type field.
 
-## The Markdown goal
+## The text view
 
-The eventual Markdown experience should feel like Bear: distraction-free
-writing, one accent colour, and typography that makes prose pleasant rather than
-a WYSIWYG toolbar. That is a different register from the CSV grid, so it should
-be a different view rather than a mode of the grid view.
+Plain text is shown, not interpreted. One monospace size, line numbers down
+the side, tabs expanded to four spaces, and no wrapping: a log line that runs
+past the window scrolls sideways rather than folding into an unreadable block.
+The caret is a steady accent bar rather than a blinking one, because a blinking
+caret in a read-mostly window is movement that does not mean anything.
+
+The status strip carries line and column, the line count, the saved state, and
+the reason a save was refused. A file decoded lossily can be read but never
+written back.
+
+## The Markdown view
+
+Markdown is a writing surface, and it should feel like Bear rather than like a
+word processor with a toolbar.
+
+- **One column, about 720 px wide, centred.** Long prose lines are hard to
+  track; the margin is doing work, not decoration.
+- **The source is the truth.** Every edit reparses the document, so row N stays
+  line N and a click can always be turned back into a byte offset.
+- **Markers are hidden until the block is active.** A paragraph reads as prose;
+  clicking it reveals the `**` around a word and the `#` before a heading, in
+  place. That is the Bear arrangement, and it keeps the reading view quiet
+  without hiding how the file is written.
+- **One accent colour.** Links, active controls, and the caret share `accent`.
+  Inline code gets `code_surface`, a blockquote gets `quote_bar`, and nothing
+  gets a border it does not need.
+- **Lists are a gutter, not punctuation.** Bullets, numbers, and checkboxes sit
+  in a narrow gutter so the text itself starts at the same place on every item.
+  Clicking a checkbox rewrites `[ ]` or `[x]` in the source.
+- **A table is a grid, and the pipes are never shown.** Alignment lives in a
+  toolbar above the active table, not in the delimiter row. Cell edits are
+  clamped to the cell's own source range, so typing cannot eat a pipe.
+- **Images are blocks.** A local path resolves relative to the Markdown file;
+  `http` and `https` go through the shared image loader. A missing or failed
+  image leaves a bordered placeholder with the alt text and the destination,
+  because a blank hole says less than an explanation.
+- **A very large file is read only.** Past 2 MB or 20,000 rows the view falls
+  back to monospace lines and says why. An instant, honest refusal is better
+  than a window that freezes while it shapes the file.
+
+The table toolbar is the one piece of chrome that appears on demand. It sits
+above the table it belongs to and is absent everywhere else.
