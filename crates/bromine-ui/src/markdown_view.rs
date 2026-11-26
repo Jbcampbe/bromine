@@ -835,6 +835,7 @@ impl MarkdownView {
         if row.kind == RowKind::Rule {
             return div()
                 .w_full()
+                .flex_shrink_0()
                 .py(px(8.0))
                 .child(div().w_full().h(px(1.0)).bg(theme::border()))
                 .into_any_element();
@@ -877,6 +878,11 @@ impl MarkdownView {
             .flex_row()
             .items_start()
             .w_full()
+            // Rows are items in the column's flex layout, which is measured
+            // against the viewport. A row that may shrink is squeezed below
+            // its text's height in a document taller than the window, and its
+            // wrapped lines paint over the row that follows.
+            .flex_shrink_0()
             .min_h(px(base.line_height()))
             .when(row.quote_depth > 0, |element| {
                 element
@@ -1640,6 +1646,51 @@ mod tests {
             cx.update(|_window, app| view.read(app).active_block()),
             Some(BlockId(0))
         );
+    }
+
+    /// A document taller than the window must scroll, not squeeze its rows.
+    /// Each row's shaped text has to fit inside the row, or wrapped lines are
+    /// painted on top of the row that follows.
+    #[gpui::test]
+    fn wrapped_rows_keep_their_height_in_a_long_document(cx: &mut TestAppContext) {
+        let item = "- A list item long enough to wrap onto several lines once it is \
+                    shaped, with `inline code`, **bold text**, and plain prose after it.\n";
+        let source = format!("## Heading\n\n{}\nend\n", item.repeat(40));
+        let (view, cx) = view(cx, &source);
+        draw(cx);
+
+        let window_height = cx.update(|window, _app| window.viewport_size().height);
+        let records = cx.update(|_window, app| {
+            let mut records: Vec<_> = view
+                .read(app)
+                .row_layouts
+                .iter()
+                .map(|(index, record)| {
+                    (*index, record.bounds, record.line.size(record.line_height))
+                })
+                .collect();
+            records.sort_by_key(|(index, _, _)| *index);
+            records
+        });
+        let bottom = records
+            .last()
+            .map(|(_, bounds, _)| bounds.bottom())
+            .unwrap();
+        assert!(
+            bottom > window_height,
+            "the document should be taller than the window ({bottom:?} <= {window_height:?})"
+        );
+
+        for pair in records.windows(2) {
+            let (index, bounds, shaped) = pair[0];
+            let (_, next, _) = pair[1];
+            assert!(
+                bounds.top() + shaped.height <= next.top() + px(1.0),
+                "row {index}'s text ends at {:?} but the next row starts at {:?}",
+                bounds.top() + shaped.height,
+                next.top()
+            );
+        }
     }
 
     #[gpui::test]
