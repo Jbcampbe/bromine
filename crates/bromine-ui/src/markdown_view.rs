@@ -835,7 +835,6 @@ impl MarkdownView {
         if row.kind == RowKind::Rule {
             return div()
                 .w_full()
-                .flex_shrink_0()
                 .py(px(8.0))
                 .child(div().w_full().h(px(1.0)).bg(theme::border()))
                 .into_any_element();
@@ -878,11 +877,6 @@ impl MarkdownView {
             .flex_row()
             .items_start()
             .w_full()
-            // Rows are items in the column's flex layout, which is measured
-            // against the viewport. A row that may shrink is squeezed below
-            // its text's height in a document taller than the window, and its
-            // wrapped lines paint over the row that follows.
-            .flex_shrink_0()
             .min_h(px(base.line_height()))
             .when(row.quote_depth > 0, |element| {
                 element
@@ -1037,8 +1031,14 @@ impl MarkdownView {
                     .w_full()
                     .max_w(px(COLUMN_MAX_WIDTH))
                     .px(px(COLUMN_PADDING))
-                    .flex()
-                    .flex_col()
+                    // Block, not a flex column. Taffy distributes a flex
+                    // column against the viewport's height, so in a document
+                    // taller than the window every row shrank and its wrapped
+                    // text painted over the next one. Opting the rows out of
+                    // shrinking instead makes taffy size each from its text's
+                    // unwrapped width, and nothing wraps. Block layout stacks
+                    // rows at their content height and the column's width.
+                    .block()
                     .children(rows),
             )
     }
@@ -1653,8 +1653,11 @@ mod tests {
     /// painted on top of the row that follows.
     #[gpui::test]
     fn wrapped_rows_keep_their_height_in_a_long_document(cx: &mut TestAppContext) {
-        let item = "- A list item long enough to wrap onto several lines once it is \
-                    shaped, with `inline code`, **bold text**, and plain prose after it.\n";
+        // The test platform's shaper gives every glyph a narrow fixed advance,
+        // so the sentence repeats until it wraps in the test window as well.
+        let sentence = "A list item long enough to wrap onto several lines once it is \
+                        shaped, with `inline code`, **bold text**, and plain prose after it. ";
+        let item = format!("- {}\n", sentence.repeat(4));
         let source = format!("## Heading\n\n{}\nend\n", item.repeat(40));
         let (view, cx) = view(cx, &source);
         draw(cx);
@@ -1680,6 +1683,25 @@ mod tests {
             bottom > window_height,
             "the document should be taller than the window ({bottom:?} <= {window_height:?})"
         );
+
+        // Keeping the height must not cost the wrapping: a row sized from its
+        // text's unwrapped width runs past the column on a single line.
+        for (index, bounds, shaped) in &records {
+            assert!(
+                shaped.width <= bounds.size.width + px(1.0),
+                "row {index}'s text is {:?} wide in a {:?} row",
+                shaped.width,
+                bounds.size.width
+            );
+        }
+        let wrapped = cx.update(|_window, app| {
+            view.read(app)
+                .row_layouts
+                .values()
+                .filter(|record| !record.line.wrap_boundaries().is_empty())
+                .count()
+        });
+        assert!(wrapped >= 40, "only {wrapped} rows wrapped");
 
         for pair in records.windows(2) {
             let (index, bounds, shaped) = pair[0];

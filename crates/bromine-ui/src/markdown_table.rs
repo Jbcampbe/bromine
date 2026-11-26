@@ -55,15 +55,7 @@ pub(crate) fn table_element(
         );
     }
 
-    // A table is one item in the document column; like a row, it must not
-    // shrink when the document is taller than the window.
-    let mut container = div()
-        .w_full()
-        .flex_shrink_0()
-        .my_3()
-        .flex()
-        .flex_col()
-        .gap_2();
+    let mut container = div().w_full().my_3().flex().flex_col().gap_2();
     if active {
         container = container.child(toolbar(view, table_index, table, cx));
     }
