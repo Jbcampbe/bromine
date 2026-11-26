@@ -1031,8 +1031,14 @@ impl MarkdownView {
                     .w_full()
                     .max_w(px(COLUMN_MAX_WIDTH))
                     .px(px(COLUMN_PADDING))
-                    .flex()
-                    .flex_col()
+                    // Block, not a flex column. Taffy distributes a flex
+                    // column against the viewport's height, so in a document
+                    // taller than the window every row shrank and its wrapped
+                    // text painted over the next one. Opting the rows out of
+                    // shrinking instead makes taffy size each from its text's
+                    // unwrapped width, and nothing wraps. Block layout stacks
+                    // rows at their content height and the column's width.
+                    .block()
                     .children(rows),
             )
     }
@@ -1640,6 +1646,73 @@ mod tests {
             cx.update(|_window, app| view.read(app).active_block()),
             Some(BlockId(0))
         );
+    }
+
+    /// A document taller than the window must scroll, not squeeze its rows.
+    /// Each row's shaped text has to fit inside the row, or wrapped lines are
+    /// painted on top of the row that follows.
+    #[gpui::test]
+    fn wrapped_rows_keep_their_height_in_a_long_document(cx: &mut TestAppContext) {
+        // The test platform's shaper gives every glyph a narrow fixed advance,
+        // so the sentence repeats until it wraps in the test window as well.
+        let sentence = "A list item long enough to wrap onto several lines once it is \
+                        shaped, with `inline code`, **bold text**, and plain prose after it. ";
+        let item = format!("- {}\n", sentence.repeat(4));
+        let source = format!("## Heading\n\n{}\nend\n", item.repeat(40));
+        let (view, cx) = view(cx, &source);
+        draw(cx);
+
+        let window_height = cx.update(|window, _app| window.viewport_size().height);
+        let records = cx.update(|_window, app| {
+            let mut records: Vec<_> = view
+                .read(app)
+                .row_layouts
+                .iter()
+                .map(|(index, record)| {
+                    (*index, record.bounds, record.line.size(record.line_height))
+                })
+                .collect();
+            records.sort_by_key(|(index, _, _)| *index);
+            records
+        });
+        let bottom = records
+            .last()
+            .map(|(_, bounds, _)| bounds.bottom())
+            .unwrap();
+        assert!(
+            bottom > window_height,
+            "the document should be taller than the window ({bottom:?} <= {window_height:?})"
+        );
+
+        // Keeping the height must not cost the wrapping: a row sized from its
+        // text's unwrapped width runs past the column on a single line.
+        for (index, bounds, shaped) in &records {
+            assert!(
+                shaped.width <= bounds.size.width + px(1.0),
+                "row {index}'s text is {:?} wide in a {:?} row",
+                shaped.width,
+                bounds.size.width
+            );
+        }
+        let wrapped = cx.update(|_window, app| {
+            view.read(app)
+                .row_layouts
+                .values()
+                .filter(|record| !record.line.wrap_boundaries().is_empty())
+                .count()
+        });
+        assert!(wrapped >= 40, "only {wrapped} rows wrapped");
+
+        for pair in records.windows(2) {
+            let (index, bounds, shaped) = pair[0];
+            let (_, next, _) = pair[1];
+            assert!(
+                bounds.top() + shaped.height <= next.top() + px(1.0),
+                "row {index}'s text ends at {:?} but the next row starts at {:?}",
+                bounds.top() + shaped.height,
+                next.top()
+            );
+        }
     }
 
     #[gpui::test]
