@@ -679,7 +679,7 @@ dependencies = [
 
 [[package]]
 name = "bromine"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "bromine-core",
@@ -692,7 +692,7 @@ dependencies = [
 
 [[package]]
 name = "bromine-core"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "csv",
  "pulldown-cmark",
@@ -703,7 +703,7 @@ dependencies = [
 
 [[package]]
 name = "bromine-ui"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "bromine-core",
  "gpui",
